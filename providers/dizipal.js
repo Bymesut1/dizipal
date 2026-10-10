@@ -337,22 +337,62 @@ function resolveEmbed(embedUrl, pageUrl, depth) {
     if (xored.length) dbg.push('sifre cozuldu ' + xored.length + ' ' + xored[0].slice(0, 90));
     found.hls = uniq(found.hls); found.mp4 = uniq(found.mp4);
     dbg.push('embed ' + hostOf(embedUrl) + ' ' + (r.status || r.err) + ' ' + (r.text || '').length + 'b hls=' + found.hls.length + ' mp4=' + found.mp4.length + ' altyazi=' + found.subs.length);
-    if (!found.hls.length && !found.mp4.length) {
-      // Video adresi bulunamadı: embed sayfasındaki script'leri (zS01, zS02 ...) debug satırlarına dök
-      var raw = String(r.text || ''), parts = [], ms, rs = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
-      while ((ms = rs.exec(raw)) !== null) {
-        var body = ms[1].replace(/\s+/g, ' ').trim();
-        if (body.length > 40 && !/^eval\(function\(p,a,c,k,e,d\)/.test(body)) parts.push('[' + body.length + '] ' + body);
+    function tail() {
+      if (!found.hls.length && !found.mp4.length) {
+        // Video adresi bulunamadı: embed sayfasındaki script'leri (zS01, zS02 ...) debug satırlarına dök
+        var raw = String(r.text || ''), parts = [], ms, rs = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
+        while ((ms = rs.exec(raw)) !== null) {
+          var body = ms[1].replace(/\s+/g, ' ').trim();
+          if (body.length > 40 && !/^eval\(function\(p,a,c,k,e,d\)/.test(body)) parts.push('[' + body.length + '] ' + body);
+        }
+        unpackAll(raw).forEach(function (u) { parts.push('[ACILMIS ' + u.length + '] ' + String(u).replace(/\s+/g, ' ').trim()); });
+        var all = parts.join(' ¦ ').slice(0, 4200), zi = 0;
+        for (var zp = 0; zp < all.length; zp += 260) { zi++; dbg.push('zS' + (zi < 10 ? '0' : '') + zi + ' ' + all.slice(zp, zp + 260)); }
       }
-      unpackAll(raw).forEach(function (u) { parts.push('[ACILMIS ' + u.length + '] ' + String(u).replace(/\s+/g, ' ').trim()); });
-      var all = parts.join(' ¦ ').slice(0, 4200), zi = 0;
-      for (var zp = 0; zp < all.length; zp += 260) { zi++; dbg.push('zS' + (zi < 10 ? '0' : '') + zi + ' ' + all.slice(zp, zp + 260)); }
+      if (!found.hls.length && !found.mp4.length && (depth || 0) < 1) {     // iç içe iframe
+        var inner = findEmbeds(r.text || '');
+        if (inner.length) return resolveEmbed(inner[0], embedUrl, 1);
+      }
+      return found;
     }
-    if (!found.hls.length && !found.mp4.length && (depth || 0) < 1) {     // iç içe iframe
-      var inner = findEmbeds(r.text || '');
-      if (inner.length) return resolveEmbed(inner[0], embedUrl, 1);
+    // FirePlayer (imagestoo vb.): video adresi sayfada değil, /player/index.php?do=getVideo isteğiyle gelir
+    var fid = null;
+    texts.forEach(function (x) { var fm = String(x).match(/FirePlayer\(\s*[\"']([A-Za-z0-9]{16,64})[\"']/); if (fm && !fid) fid = fm[1]; });
+    if (!fid && /FirePlayer|fireplay/i.test(r.text || '')) { var um = String(embedUrl).match(/\/video\/([A-Za-z0-9]{16,64})/); if (um) fid = um[1]; }
+    if (fid && !found.hls.length && !found.mp4.length) {
+      return fireVideo(embedUrl, pageUrl, fid).then(function (fv) {
+        fv.hls.forEach(function (u) { if (found.hls.indexOf(u) === -1) found.hls.push(u); });
+        fv.mp4.forEach(function (u) { if (found.mp4.indexOf(u) === -1) found.mp4.push(u); });
+        fv.subs.forEach(function (sb) { found.subs.push(sb); });
+        return tail();
+      });
     }
-    return found;
+    return tail();
+  });
+}
+// FirePlayer: POST <embed>/player/index.php?data=<id>&do=getVideo  (hash=<id>&r=<sayfa>)  -> { videoSource, securedLink, ... }
+function fireVideo(embedUrl, pageUrl, id) {
+  var origin = originOf(embedUrl), url = origin + '/player/index.php?data=' + id + '&do=getVideo';
+  function attempt(rf) {
+    var h = hdr(embedUrl, { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', 'Origin': origin, 'Accept': 'application/json, text/javascript, */*; q=0.01' });
+    return postForm(url, 'hash=' + id + '&r=' + encodeURIComponent(rf), h).then(function (r) {
+      var t = r.text || '', o = null, hls = [], mp4 = [];
+      dbg.push('fp ' + (r.status || r.err) + ' ' + t.length + 'b ' + t.slice(0, 160).replace(/\s+/g, ' '));
+      try { o = JSON.parse(t); } catch (e) {}
+      if (o) ['videoSource', 'securedLink', 'source', 'file', 'url'].forEach(function (k) {
+        var v = o[k];
+        if (typeof v !== 'string' || !/^(?:https?:)?\/\//i.test(v)) return;
+        v = fixUrl(v);
+        if (/\.mp4(?:\?|$)/i.test(v) && o.hls !== true) mp4.push(v); else hls.push(v);
+      });
+      var sc = scanText(t.replace(/\\\//g, '/'), origin);
+      sc.hls.forEach(function (u) { hls.push(u); }); sc.mp4.forEach(function (u) { mp4.push(u); });
+      return { hls: uniq(hls), mp4: uniq(mp4), subs: sc.subs };
+    });
+  }
+  return attempt(pageUrl).then(function (a) {
+    if (a.hls.length || a.mp4.length) return a;
+    return attempt('').then(function (b) { return (b.hls.length || b.mp4.length) ? b : a; });
   });
 }
 function qualOf(h) { return h ? h + 'p' : 'Auto'; }
@@ -769,7 +809,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.10'];
+  dbg = ['dizipal v1.3.11'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
