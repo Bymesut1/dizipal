@@ -7,12 +7,13 @@
 var AYAR = {
   SITELER: ['https://dizipal2138.com', 'https://dizipal2139.com'],   // adres değişirse sıradakine geçer
   EKLENTI_ADI: 'Dizipal',
-  DEBUG_MODU: true,    // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
+  DEBUG_MODU: false,    // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
   MAX_ADAY: 3,          // en fazla kaç aday dizi/film sayfası denensin
   MAX_SORGU: 3,         // en fazla kaç arama yapılsın
   MAX_EMBED: 3,         // en fazla kaç player (embed) çözülsün
   SES_SIRA: 0,          // 0 = her ses parçasını ayrı akış göster (Ses 1, Ses 2...). Belirli bir sıra (ör. 2) yazılırsa sadece o gösterilir
   ALTYAZI: true,        // yerleşik altyazıları bul
+  ALTYAZI_BARINDIR: true, // altyazı sunucusu Referer/Origin istiyor ve oynatıcı bunu gönderemiyorsa: Türkçe altyazı metni geçici bir paste sitesine (paste.rs / dpaste.com / pastes.dev) yüklenip oradan verilir. İstemezsen false yap.
   ARAMA_SURESI: 5000,   // ms
   SUNUCU_SURESI: 6000,  // ms
   GENEL_SURE: 24000     // ms
@@ -455,18 +456,72 @@ function toVtt(t) {
 }
 // Altyazıyı Nuvio'nun göreceği şekilde dene: başlıksız (Referer/Origin yok) indirilebiliyor mu, içinde replik var mı?
 // Başlıklarla iner ama başlıksız inmiyorsa (oynatıcı altyazıyı başlıksız ister) içerik doğrudan data: adresi olarak da verilir.
-function checkSub(sb, ref) {
+var subNote = '';            // son altyazı durumu (DEBUG_MODU'nda akış adında görünür)
+var REHOST_CACHE = {};
+function plainOk(u) {
+  return fetchInfo(u, { 'User-Agent': 'ExoPlayer' }, true).then(function (r) { var t = r.text || ''; return r.status === 200 && /^\s*WEBVTT/.test(t) && cueCount(t) > 0; });
+}
+// Başlıksız erişilebilir bir adres üret: paste sitelerine yükle, yüklenen adresi başlıksız indirip doğrula
+function rehostVtt(vtt) {
+  if (!AYAR.ALTYAZI_BARINDIR) return Promise.resolve('');
+  var providers = [
+    { n: 'paste.rs', run: function () {
+        return postForm('https://paste.rs', vtt, { 'Content-Type': 'text/plain; charset=utf-8', 'User-Agent': UA }).then(function (r) {
+          var u = String(r.text || '').trim().split(/\s+/)[0];
+          return /^https?:\/\/paste\.rs\/[A-Za-z0-9]+$/.test(u) ? u + '.vtt' : '';
+        });
+    } },
+    { n: 'dpaste.com', run: function () {
+        return postForm('https://dpaste.com/api/v2/', 'syntax=text&expiry_days=3&content=' + encodeURIComponent(vtt), { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'User-Agent': UA }).then(function (r) {
+          var u = String(r.text || '').trim().split(/\s+/)[0];
+          return /^https?:\/\/dpaste\.com\/[A-Za-z0-9]+$/.test(u) ? u + '.txt' : '';
+        });
+    } },
+    { n: 'pastes.dev', run: function () {
+        return postForm('https://api.pastes.dev/post', vtt, { 'Content-Type': 'text/plain; charset=utf-8', 'User-Agent': UA }).then(function (r) {
+          var k = ''; try { k = JSON.parse(r.text).key || ''; } catch (e) {}
+          return k ? 'https://api.pastes.dev/' + k : '';
+        });
+    } }
+  ];
+  function next(i) {
+    if (i >= providers.length) return Promise.resolve('');
+    return providers[i].run().then(function (u) {
+      if (!u) { dbg.push('barindir ' + providers[i].n + ' yok'); return next(i + 1); }
+      return plainOk(u).then(function (ok) {
+        dbg.push('barindir ' + providers[i].n + ' ' + (ok ? 'OK ' : 'DOGRULANAMADI ') + u);
+        if (ok) { subNote = 'yuklendi:' + providers[i].n; return u; }
+        return next(i + 1);
+      });
+    }, function () { return next(i + 1); });
+  }
+  return next(0);
+}
+
+// Altyazıyı Nuvio'nun göreceği şekilde dene: başlıksız (Referer/Origin yok) indirilebiliyor mu, içinde replik var mı?
+// Başlıksız inmiyorsa: (1) metni başlıksız erişilebilir bir adrese yükle, (2) olmazsa orijinal adres + data: adresi ver.
+function checkSub(sb, ref, allowRehost) {
   var h = hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') });
   return Promise.all([fetchInfo(sb.url, h, true), fetchInfo(sb.url, { 'User-Agent': 'ExoPlayer' }, true)]).then(function (rs) {
     var a = rs[0], b = rs[1], at = a.text || '', bt = b.text || '';
     var aOk = a.status === 200 && cueCount(at) > 0, bOk = b.status === 200 && /^\s*WEBVTT/.test(bt) && cueCount(bt) > 0;
     dbg.push('altyazi test ' + sb.lang + ' basliklı=' + (a.status || a.err) + '/' + at.length + 'b/' + cueCount(at) + 'replik basliksiz=' + (b.status || b.err) + '/' + bt.length + 'b/' + cueCount(bt) + 'replik ilk=' + at.slice(0, 14).replace(/\s+/g, ' '));
-    if (!aOk) return [];                                              // boş / erişilemeyen altyazı listeye girmez
-    if (bOk) return [sb];                                             // başlıksız da iniyor: olduğu gibi
-    var out = [];
-    if (at.length < 1500000) out.push({ url: 'data:text/vtt;charset=utf-8;base64,' + b64enc(utf8Bytes(toVtt(at))), lang: sb.lang, label: sb.label, inline: true });
-    out.push({ url: sb.url, lang: sb.lang, label: sb.label + ' (bağlantı)' });   // yedek: oynatıcı data: adresini desteklemezse bunu seç
-    return out;
+    if (!aOk) { subNote = 'bos/erisilemez'; return []; }             // boş / erişilemeyen altyazı listeye girmez
+    if (bOk) { if (!subNote) subNote = 'acik'; return [sb]; }        // başlıksız da iniyor: olduğu gibi
+    var vtt = toVtt(at);
+    var cached = REHOST_CACHE[sb.url];
+    var rh = (allowRehost === false) ? Promise.resolve('') : (cached ? Promise.resolve(cached) : rehostVtt(vtt));
+    return rh.then(function (u) {
+      if (u) REHOST_CACHE[sb.url] = u;
+      var out = [];
+      if (u) out.push({ url: u, lang: sb.lang, label: sb.label });                         // başlıksız erişilebilir kopya
+      out.push({ url: sb.url, lang: sb.lang, label: sb.label + ' (kaynak)', withHeaders: true });   // orijinal: yalnızca oynatıcı başlık gönderebiliyorsa çalışır
+      if (!u) {
+        subNote = 'baslikli-kaynak(data+link)';
+        if (at.length < 1500000) out.push({ url: 'data:text/vtt;charset=utf-8;base64,' + b64enc(utf8Bytes(vtt)), lang: sb.lang, label: sb.label + ' (gömülü)', inline: true });
+      }
+      return out;
+    });
   }).catch(function () { return [sb]; });
 }
 function verifySub(s, ref) {
@@ -647,8 +702,8 @@ function configTargets(c, base) {
 // ---------------- Ana akış ----------------
 function debugStream(msg) {
   if (!AYAR.DEBUG_MODU) return [];
-  return [msg].concat(dbg.slice(0, 120)).map(function (r) {
-    return { name: 'DEBUG ' + r, title: 'DEBUG ' + r, url: 'https://debug.invalid/', quality: 'Auto', provider: PROVIDER_ID };
+  return [msg].concat(dbg.slice(0, 120)).map(function (r, i) {
+    return { name: 'DEBUG ' + r, title: 'DEBUG ' + r, url: 'https://debug.invalid/' + i, quality: 'Auto', provider: PROVIDER_ID };
   });
 }
 function buildStreams(found, pageUrl, label) {
@@ -681,7 +736,8 @@ function buildStreams(found, pageUrl, label) {
         return g;
       }).sort(function (a, b) { return (a.lang === 'tur' ? 0 : 1) - (b.lang === 'tur' ? 0 : 1); });
       dbg.push('altyazi sonuc ' + good.map(function (g) { return g.lang + ':' + g.url.slice(-40); }).join(' | '));
-      return Promise.all(good.slice(0, 3).map(function (sb) { return checkSub(sb, ref); })).then(function (lists) {
+      subNote = '';
+      return Promise.all(good.slice(0, 3).map(function (sb, i) { return checkSub(sb, ref, i === 0); })).then(function (lists) {
       var fin = [];
       lists.forEach(function (l) { l.forEach(function (x) { fin.push(x); }); });
       good = fin;
@@ -693,9 +749,9 @@ function buildStreams(found, pageUrl, label) {
         if (it.native) parts.push('Yerleşik altyazı' + (it.subnames ? ': ' + it.subnames : ''));
         parts.push(it.quality);
         if (good.length) parts.push(good.some(function (g) { return g.lang === 'tur'; }) ? 'TR Altyazı' : 'Altyazı');
-        var st = { name: AYAR.EKLENTI_ADI, title: parts.join(' | '), url: it.url, quality: it.quality, headers: headers, provider: PROVIDER_ID };
+        var st = { name: AYAR.EKLENTI_ADI + (AYAR.DEBUG_MODU ? ' [altyazi: ' + (subNote || (good.length ? '?' : 'yok')) + ']' : ''), title: parts.join(' | '), url: it.url, quality: it.quality, headers: headers, provider: PROVIDER_ID };
         if (it.mp4) st.type = 'mp4';
-        if (good.length) st.subtitles = good.map(function (s, i) { return { url: s.url, lang: s.lang, language: s.lang === 'tur' ? 'Turkish' : s.lang, label: s.label, name: s.label, id: s.lang + (i ? i : ''), kind: 'subtitles', headers: s.inline ? undefined : headers }; });
+        if (good.length) st.subtitles = good.map(function (s, i) { return { url: s.url, lang: s.lang, language: s.lang === 'tur' ? 'Turkish' : s.lang, label: s.label, name: s.label, id: s.lang + (i ? i : ''), kind: 'subtitles', headers: (s.inline || !s.withHeaders) ? undefined : headers }; });
         return st;
       });
       });
@@ -707,7 +763,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.6'];
+  dbg = ['dizipal v1.3.7'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
