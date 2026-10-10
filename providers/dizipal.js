@@ -425,6 +425,50 @@ function guessVtt(u) {
   }
   return out;
 }
+function utf8Bytes(str) {
+  var out = [], i, c;
+  str = String(str || '');
+  for (i = 0; i < str.length; i++) {
+    c = str.charCodeAt(i);
+    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) c = 0x10000 + ((c - 0xD800) << 10) + (str.charCodeAt(++i) - 0xDC00);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xC0 | (c >> 6), 0x80 | (c & 63));
+    else if (c < 0x10000) out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else out.push(0xF0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return out;
+}
+function b64enc(bytes) {
+  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/', r = '', i, a, b, c;
+  for (i = 0; i < bytes.length; i += 3) {
+    a = bytes[i]; b = bytes[i + 1]; c = bytes[i + 2];
+    r += C.charAt(a >> 2) + C.charAt(((a & 3) << 4) | ((b || 0) >> 4)) + (i + 1 < bytes.length ? C.charAt(((b & 15) << 2) | ((c || 0) >> 6)) : '=') + (i + 2 < bytes.length ? C.charAt(c & 63) : '=');
+  }
+  return r;
+}
+function cueCount(t) { return (String(t || '').match(/-->/g) || []).length; }
+// SRT ise WebVTT'ye çevir; WebVTT'deki X-TIMESTAMP-MAP (HLS kayması) satırını sil
+function toVtt(t) {
+  t = String(t || '').replace(/^\uFEFF/, '');
+  if (!/^\s*WEBVTT/.test(t)) t = 'WEBVTT\n\n' + t.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  return t.replace(/^X-TIMESTAMP-MAP=[^\r\n]*[\r\n]*/m, '');
+}
+// Altyazıyı Nuvio'nun göreceği şekilde dene: başlıksız (Referer/Origin yok) indirilebiliyor mu, içinde replik var mı?
+// Başlıklarla iner ama başlıksız inmiyorsa (oynatıcı altyazıyı başlıksız ister) içerik doğrudan data: adresi olarak da verilir.
+function checkSub(sb, ref) {
+  var h = hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') });
+  return Promise.all([fetchInfo(sb.url, h, true), fetchInfo(sb.url, { 'User-Agent': 'ExoPlayer' }, true)]).then(function (rs) {
+    var a = rs[0], b = rs[1], at = a.text || '', bt = b.text || '';
+    var aOk = a.status === 200 && cueCount(at) > 0, bOk = b.status === 200 && /^\s*WEBVTT/.test(bt) && cueCount(bt) > 0;
+    dbg.push('altyazi test ' + sb.lang + ' basliklı=' + (a.status || a.err) + '/' + at.length + 'b/' + cueCount(at) + 'replik basliksiz=' + (b.status || b.err) + '/' + bt.length + 'b/' + cueCount(bt) + 'replik ilk=' + at.slice(0, 14).replace(/\s+/g, ' '));
+    if (!aOk) return [];                                              // boş / erişilemeyen altyazı listeye girmez
+    if (bOk) return [sb];                                             // başlıksız da iniyor: olduğu gibi
+    var out = [];
+    if (at.length < 1500000) out.push({ url: 'data:text/vtt;charset=utf-8;base64,' + b64enc(utf8Bytes(toVtt(at))), lang: sb.lang, label: sb.label, inline: true });
+    out.push({ url: sb.url, lang: sb.lang, label: sb.label + ' (bağlantı)' });   // yedek: oynatıcı data: adresini desteklemezse bunu seç
+    return out;
+  }).catch(function () { return [sb]; });
+}
 function verifySub(s, ref) {
   return fetchInfo(s.url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true).then(function (r) { var ok = r.status === 200 && /^\s*WEBVTT/.test(r.text || ''); dbg.push('altyazi ' + s.lang + ' ' + (r.status || r.err) + (ok ? ' ok' : ' yok')); return ok ? s : null; });
 }
@@ -637,6 +681,10 @@ function buildStreams(found, pageUrl, label) {
         return g;
       }).sort(function (a, b) { return (a.lang === 'tur' ? 0 : 1) - (b.lang === 'tur' ? 0 : 1); });
       dbg.push('altyazi sonuc ' + good.map(function (g) { return g.lang + ':' + g.url.slice(-40); }).join(' | '));
+      return Promise.all(good.slice(0, 3).map(function (sb) { return checkSub(sb, ref); })).then(function (lists) {
+      var fin = [];
+      lists.forEach(function (l) { l.forEach(function (x) { fin.push(x); }); });
+      good = fin;
       var seen = {};
       return items.filter(function (it) { if (seen[it.url]) return false; seen[it.url] = true; return true; }).map(function (it) {
         var parts = ['Dizipal', it.mp4 ? 'MP4' : 'HLS'];
@@ -647,8 +695,9 @@ function buildStreams(found, pageUrl, label) {
         if (good.length) parts.push(good.some(function (g) { return g.lang === 'tur'; }) ? 'TR Altyazı' : 'Altyazı');
         var st = { name: AYAR.EKLENTI_ADI, title: parts.join(' | '), url: it.url, quality: it.quality, headers: headers, provider: PROVIDER_ID };
         if (it.mp4) st.type = 'mp4';
-        if (good.length) st.subtitles = good.map(function (s) { return { url: s.url, lang: s.lang, language: s.lang === 'tur' ? 'Turkish' : s.lang, label: s.label, name: s.label, id: s.lang, kind: 'subtitles' }; });
+        if (good.length) st.subtitles = good.map(function (s, i) { return { url: s.url, lang: s.lang, language: s.lang === 'tur' ? 'Turkish' : s.lang, label: s.label, name: s.label, id: s.lang + (i ? i : ''), kind: 'subtitles', headers: s.inline ? undefined : headers }; });
         return st;
+      });
       });
     });
   });
@@ -658,7 +707,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.5'];
+  dbg = ['dizipal v1.3.6'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
