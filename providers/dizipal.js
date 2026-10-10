@@ -7,7 +7,7 @@
 var AYAR = {
   SITELER: ['https://dizipal2138.com', 'https://dizipal2139.com'],   // adres değişirse sıradakine geçer
   EKLENTI_ADI: 'Dizipal',
-  DEBUG_MODU: false,     // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
+  DEBUG_MODU: false,    // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
   MAX_ADAY: 3,          // en fazla kaç aday dizi/film sayfası denensin
   MAX_SORGU: 3,         // en fazla kaç arama yapılsın
   MAX_EMBED: 3,         // en fazla kaç player (embed) çözülsün
@@ -579,7 +579,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.2'];
+  dbg = ['dizipal v1.3.3'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
