@@ -7,7 +7,7 @@
 var AYAR = {
   SITELER: ['https://dizipal2138.com', 'https://dizipal2139.com'],   // adres değişirse sıradakine geçer
   EKLENTI_ADI: 'Dizipal',
-  DEBUG_MODU: true,    // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
+  DEBUG_MODU: false,    // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
   MAX_ADAY: 3,          // en fazla kaç aday dizi/film sayfası denensin
   MAX_SORGU: 3,         // en fazla kaç arama yapılsın
   MAX_EMBED: 3,         // en fazla kaç player (embed) çözülsün
@@ -15,8 +15,8 @@ var AYAR = {
   ALTYAZI: true,        // yerleşik altyazıları bul
   ALTYAZI_BARINDIR: true, // altyazı sunucusu Referer/Origin istiyor ve oynatıcı bunu gönderemiyorsa: Türkçe altyazı metni geçici bir paste sitesine (paste.rs / dpaste.com / pastes.dev) yüklenip oradan verilir. İstemezsen false yap.
   ARAMA_SURESI: 5000,   // ms
-  SUNUCU_SURESI: 6000,  // ms
-  GENEL_SURE: 24000     // ms
+  SUNUCU_SURESI: 5000,  // ms
+  GENEL_SURE: 20000     // ms
 };
 
 var TMDB_KEY = '000316508321ce461cf81e7c6815eec7';
@@ -357,8 +357,8 @@ function resolveEmbed(embedUrl, pageUrl, depth) {
 }
 function qualOf(h) { return h ? h + 'p' : 'Auto'; }
 // Ana liste (master): ses seçenekleri, kalite varyantları ve yerleşik altyazı satırları
-function inspectHls1(url, ref) {
-  return fetchInfo(url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true).then(function (r) {
+function inspectHls1(url, ref, pre) {
+  return (pre ? Promise.resolve(pre) : fetchInfo(url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true)).then(function (r) {
     var t = r.text || '', base = r.url || url;
     if (AYAR.DEBUG_MODU) dumpLong('hM', t.replace(/https?:\/\/[^\s"']+\//g, '…/'), 110, 7);
     if (t.indexOf('#EXT-X-STREAM-INF') === -1) { dbg.push('hls varyant yok ' + (r.status || r.err) + ' ' + t.length + 'b'); return { list: [{ url: url, quality: 'Auto' }], subs: [] }; }
@@ -419,15 +419,15 @@ function inspectHls1(url, ref) {
     return waitWithin(spj, 3500).then(function () { return sres; });
   });
 }
-// Liste yalnızca doğru Referer ile iniyorsa (embed sitesi / Dizipal sayfası) çalışan Referer'i bulur
+// Liste yalnızca doğru Referer ile iniyorsa (embed sitesi / Dizipal sayfası): ikisi paralel denenir, çalışan seçilir (tek tur)
 function inspectHls(url, ref, alt) {
   function probe(r0) { return fetchInfo(url, hdr(r0, { 'Origin': String(r0).replace(/\/$/, '') }), true); }
-  return probe(ref).then(function (r) {
-    if ((r.text || '').indexOf('#EXTM3U') > -1 || !alt || alt === ref) return inspectHls1(url, ref);
-    return probe(alt).then(function (r2) {
-      if ((r2.text || '').indexOf('#EXTM3U') > -1) { dbg.push('hls referer=alt'); return inspectHls1(url, alt).then(function (x) { x.ref = alt; return x; }); }
-      return inspectHls1(url, ref);
-    });
+  var useAlt = alt && alt !== ref;
+  return Promise.all([probe(ref), useAlt ? probe(alt) : Promise.resolve(null)]).then(function (rs) {
+    var ok0 = (rs[0].text || '').indexOf('#EXTM3U') > -1, ok1 = rs[1] && (rs[1].text || '').indexOf('#EXTM3U') > -1;
+    dbg.push('hls m3 ' + (rs[0].status || rs[0].err) + '/' + (rs[0].text || '').length + 'b' + (rs[1] ? ' alt=' + (rs[1].status || rs[1].err) + '/' + (rs[1].text || '').length + 'b' : '') + ' ilk=' + String(rs[0].text || '').slice(0, 20).replace(/\s+/g, ' '));
+    if (!ok0 && ok1) return inspectHls1(url, alt, rs[1]).then(function (x) { x.ref = alt; return x; });
+    return inspectHls1(url, ref, rs[0]);
   });
 }
 // /hls2/01/00009/<kod>_h/...  ->  /vtt/01/00009/<kod>_tur.vtt
