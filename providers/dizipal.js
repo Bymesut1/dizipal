@@ -168,7 +168,7 @@ function findEmbeds(html) {
     u = fixUrl(u);
     if (!/^https?:/i.test(u) || seen[u]) return;
     if (/google|youtube|facebook|twitter|blogger|googletagmanager|cloudflare|shrgo|t\.ly|bit\.ly|cutt\.ly|sivo\.|rebrand|gshort|girgara|rogagir/i.test(hostOf(u))) return;
-    if (AYAR.SITELER.some(function (s) { return hostOf(s) === hostOf(u); })) return;
+    if (AYAR.SITELER.some(function (s) { return hostOf(s) === hostOf(u); }) && u.replace(/^https?:\/\/[^\/]+/, '').length < 2) return;
     seen[u] = true; out.push(u);
   }
   function scan(t) {
@@ -176,6 +176,8 @@ function findEmbeds(html) {
     while ((mm = re.exec(t)) !== null) add(mm[1]);
     var re2 = /https?:\\?\/\\?\/[a-z0-9.\-]+\\?\/(?:embed-|embed\/|e\/|v\/)[A-Za-z0-9_\-]+(?:\.html)?/gi;
     while ((mm = re2.exec(t)) !== null) add(mm[0]);
+    var re4 = /(?:data-[a-z\-]+|src|href|value)=["']((?:https?:)?\/\/[^"'\s]+?)["']/gi;
+    while ((mm = re4.exec(t)) !== null) { if (/player|embed|iframe|\/e\/|\/v\/|vidmoly|filemoon|streamtape|dood|upstream|mixdrop|sibnet|hls/i.test(mm[1]) && !/\.(?:js|css|png|jpe?g|webp|gif|svg|ico|woff2?)(?:\?|$)/i.test(mm[1])) add(mm[1]); }
   }
   html = String(html || '');
   scan(html);
@@ -377,6 +379,17 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
         return fetchSite(path).then(function (r) {
           var embeds = r.status === 200 ? findEmbeds(r.text) : [];
           dbg.push('sayfa ' + path + ' ' + (r.status || r.err) + ' embed=' + embeds.length);
+          if (!embeds.length && r.text) {
+            var tx = r.text, ifr = [], mi, rei = /<iframe[^>]*>/gi;
+            while ((mi = rei.exec(tx)) !== null && ifr.length < 3) ifr.push(mi[0].slice(0, 140));
+            dbg.push('html ' + tx.length + 'b iframe=' + ifr.length + ' ' + ifr.join(' ~ '));
+            var kw = ['player', 'embed', 'data-src', 'atob(', 'ajax', 'nonce', 'm3u8', 'sources', 'video'].map(function (k) { return k + ':' + (tx.split(k).length - 1); });
+            dbg.push('kelime ' + kw.join(' '));
+            var pi = tx.search(/player|embed/i);
+            if (pi > -1) dbg.push('iz ' + tx.slice(Math.max(0, pi - 60), pi + 160).replace(/\s+/g, ' '));
+            var ti = tx.match(/<title>([^<]{0,80})/i);
+            if (ti) dbg.push('baslik ' + ti[1]);
+          }
           if (embeds.length) pages[i] = { url: (r.base || AYAR.SITELER[0]) + path, embeds: embeds };
         });
       });
