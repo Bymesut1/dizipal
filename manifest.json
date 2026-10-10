@@ -7,13 +7,15 @@
     {
       "id": "dizipal",
       "name": "Dizipal",
-      "description": "Dizipal üzerinden Türkçe dublaj/altyazılı dizi ve film akışları (m3u8 + .vtt altyazı).",
+      "description": "Dizipal üzerinden Türkçe dublaj/altyazılı dizi ve film akışları.",
       "version": "1.0.0",
       "author": "",
-      "filename": "dizipal.js",
+      "filename": "providers/dizipal.js",
       "supportedTypes": ["movie", "tv"],
+      "supportedPlatforms": ["ios", "android"],
       "enabled": true,
-      "formats": ["m3u8", "mp4"],
+      "limited": false,
+      "formats": ["mp4", "mkv"],
       "contentLanguage": ["tr"],
       "logo": ""
     }
