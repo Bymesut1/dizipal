@@ -115,15 +115,23 @@ function unpackAll(text) {
   return out;
 }
 
-// { status, url (yönlendirme sonrası), ct, text, media }
+
+function cookieOf(res) {
+  var raw = '';
+  try { raw = String(res.headers.get('set-cookie') || ''); } catch (e) {}
+  if (!raw) return '';
+  return raw.split(/,(?=\s*[A-Za-z0-9_\-]+=)/).map(function (c) { return c.split(';')[0].trim(); }).filter(Boolean).join('; ');
+}
+// { status, url (yönlendirme sonrası), ct, text, media, cookie }
 function fetchInfo(url, headers, wantText) {
   return withTimeout(fetch(url, { headers: headers }), AYAR.SUNUCU_SURESI).then(function (res) {
     var ct = ''; try { ct = String(res.headers.get('content-type') || ''); } catch (e) {}
     var fin = res.url || url;
-    if (!wantText && /^(video|audio)\/|mpegurl|dash\+xml|octet-stream/i.test(ct)) return { status: res.status, url: fin, ct: ct, text: '', media: true };
+    var ck = cookieOf(res);
+    if (!wantText && /^(video|audio)\/|mpegurl|dash\+xml|octet-stream/i.test(ct)) return { status: res.status, url: fin, ct: ct, text: '', media: true, cookie: ck };
     return withTimeout(res.text(), 6000).then(
-      function (t) { return { status: res.status, url: fin, ct: ct, text: t || '', media: false }; },
-      function () { return { status: res.status, url: fin, ct: ct, text: '', media: false }; });
+      function (t) { return { status: res.status, url: fin, ct: ct, text: t || '', media: false, cookie: ck }; },
+      function () { return { status: res.status, url: fin, ct: ct, text: '', media: false, cookie: ck }; });
   }).catch(function (e) { return { status: 0, url: url, ct: '', text: '', media: false, err: (e && e.message) || 'hata' }; });
 }
 // Site adresi değişmiş / erişilemiyorsa sıradaki adresi dene
@@ -366,7 +374,7 @@ function decryptEnc(enc) {
   } catch (e) { return null; }
 }
 function postForm(url, body, headers) {
-  return withTimeout(fetch(url, { method: 'POST', headers: headers, body: body }), AYAR.SUNUCU_SURESI).then(function (res) {
+  return withTimeout(fetch(url, { method: 'POST', headers: headers, body: body }), 5000).then(function (res) {
     return withTimeout(res.text(), 6000).then(
       function (t) { return { status: res.status, text: t || '' }; },
       function () { return { status: res.status, text: '' }; });
@@ -377,30 +385,48 @@ function dumpLong(tag, str, size, max) {
   for (var i = 0; i < max && i * size < str.length; i++) dbg.push(tag + (i + 1) + ' ' + str.substr(i * size, size));
 }
 // Sayfadaki #videoContainer[data-cfg] -> POST /ajax-player-config -> { t, v, p }
-function getPlayerConfig(html, base, pageUrl) {
+function parseConfigResp(r, tag) {
+  var o = null; try { o = JSON.parse(r.text); } catch (e) {}
+  if (!o) { dbg.push(tag + ' ' + (r.status || r.err) + ' ' + r.text.length + 'b ' + r.text.slice(0, 90).replace(/\s+/g, ' ')); return null; }
+  var c = o.config || {};
+  if (o.enc) { var v = decryptEnc(o.enc); dbg.push(tag + ' sifre ' + (v ? 'ok' : 'COZULEMEDI')); if (v) c.v = v; }
+  if (!c.v) { dbg.push(tag + ' ' + (r.status || r.err) + ' ' + JSON.stringify(o).slice(0, 110)); return null; }
+  dbg.push(tag + ' oyuncu t=' + (c.t || 'embed') + ' ' + String(c.v).slice(0, 100));
+  return c;
+}
+function getPlayerConfig(html, base, pageUrl, pageCookie) {
   html = String(html || '');
   var tag = html.match(/<[^>]*id=["']videoContainer["'][^>]*>/i);
   var cm = (tag && tag[0].match(/data-cfg=["']([^"']+)["']/i)) || html.match(/data-cfg=["']([^"']+)["']/i);
   if (!cm) { dbg.push('cfg yok'); return Promise.resolve(null); }
-  var cfg = decodeHtml(cm[1]);
-  var h = hdr(pageUrl, {
-    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    'X-Requested-With': 'XMLHttpRequest', 'Origin': base,
-    'Accept': 'application/json, text/javascript, */*; q=0.01'
-  });
-  return postForm(base + '/ajax-player-config', 'cfg=' + encodeURIComponent(cfg), h).then(function (r) {
-    var o = null; try { o = JSON.parse(r.text); } catch (e) {}
-    dbg.push('config ' + (r.status || r.err) + ' ' + r.text.length + 'b ' + (o ? Object.keys(o).join(',') : r.text.slice(0, 90)));
-    if (!o) return null;
-    var c = o.config || {};
-    if (o.enc) {
-      var v = decryptEnc(o.enc);
-      dbg.push('sifre ' + (v ? 'ok ' + v.length + 'b' : 'COZULEMEDI'));
-      if (v) c.v = v;
-    }
-    if (!c.v) return null;
-    dbg.push('oyuncu t=' + (c.t || 'embed') + ' ' + String(c.v).slice(0, 100));
-    return c;
+  var cfg = decodeHtml(cm[1]), url = base + '/ajax-player-config';
+  var csrfM = html.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i);
+  var csrf = csrfM ? csrfM[1] : '';
+  dbg.push('cfg ' + cfg.length + ' cookie=' + (pageCookie ? pageCookie.length : 0) + ' csrf=' + (csrf ? 1 : 0));
+  var ct = 'application/x-www-form-urlencoded; charset=UTF-8';
+  function H(extra) { return hdr(pageUrl, extra); }
+  // A: tarayıcıdaki gibi
+  var hA = { 'Content-Type': ct, 'X-Requested-With': 'XMLHttpRequest', 'Origin': base, 'Accept': 'application/json, text/javascript, */*; q=0.01' };
+  if (pageCookie) hA['Cookie'] = pageCookie;
+  return postForm(url, 'cfg=' + encodeURIComponent(cfg), H(hA)).then(function (r) {
+    var c = parseConfigResp(r, 'A');
+    if (c) return c;
+    // B: ajax-token + csrf
+    return fetchInfo(base + '/ajax-token', H({ 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json', 'Cookie': pageCookie || '' }), true).then(function (tr) {
+      var tok = ''; try { tok = JSON.parse(tr.text).t || ''; } catch (e) {}
+      dbg.push('token ' + (tr.status || tr.err) + ' ' + (tok ? tok.length : 0) + ' cookie=' + (tr.cookie ? 1 : 0));
+      var ck = [pageCookie, tr.cookie, tok ? '_ct=' + tok : ''].filter(Boolean).join('; ');
+      var hB = { 'Content-Type': ct, 'X-Requested-With': 'XMLHttpRequest', 'Origin': base, 'Accept': 'application/json, text/javascript, */*; q=0.01' };
+      if (ck) hB['Cookie'] = ck;
+      if (csrf || tok) hB['X-CSRF-Token'] = csrf || tok;
+      var body = 'cfg=' + encodeURIComponent(cfg) + (tok ? '&token=' + encodeURIComponent(tok) + '&csrf_token=' + encodeURIComponent(tok) : (csrf ? '&csrf_token=' + encodeURIComponent(csrf) : ''));
+      return postForm(url, body, H(hB)).then(function (r2) {
+        var c2 = parseConfigResp(r2, 'B');
+        if (c2) return c2;
+        // C: sade istek
+        return postForm(url, 'cfg=' + encodeURIComponent(cfg), { 'Content-Type': ct, 'User-Agent': UA, 'Referer': pageUrl }).then(function (r3) { return parseConfigResp(r3, 'C'); });
+      });
+    });
   });
 }
 function configTargets(c, base) {
@@ -466,7 +492,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.1.0'];
+  dbg = ['dizipal v1.2.0'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
@@ -517,7 +543,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
           var base = r.base || AYAR.SITELER[0], pageUrl = base + path, html = r.status === 200 ? (r.text || '') : '';
           dbg.push('sayfa ' + path + ' ' + (r.status || r.err) + ' ' + html.length + 'b');
           if (!html) return;
-          return getPlayerConfig(html, base, pageUrl).then(function (cfg) {
+          return getPlayerConfig(html, base, pageUrl, r.cookie || '').then(function (cfg) {
             var t = cfg ? configTargets(cfg, base) : { embeds: [], direct: null };
             if (!t.embeds.length && !t.direct) t.embeds = findEmbeds(html);
             dbg.push('player embed=' + t.embeds.length + (t.direct ? ' direct' : ''));
