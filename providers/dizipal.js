@@ -401,7 +401,7 @@ function inspectHls1(url, ref, pre) {
   return (pre ? Promise.resolve(pre) : fetchInfo(url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true)).then(function (r) {
     var t = r.text || '', base = r.url || url;
     if (AYAR.DEBUG_MODU) dumpLong('hM', t.replace(/https?:\/\/[^\s"']+\//g, '…/'), 110, 7);
-    if (t.indexOf('#EXT-X-STREAM-INF') === -1) { dbg.push('hls varyant yok ' + (r.status || r.err) + ' ' + t.length + 'b'); return { list: [{ url: url, quality: 'Auto' }], subs: [] }; }
+    if (t.indexOf('#EXT-X-STREAM-INF') === -1) { dbg.push('hls varyant yok ' + (r.status || r.err) + ' ' + t.length + 'b'); return { list: [{ url: url, quality: 'Auto', bad: t.indexOf('#EXTM3U') === -1 }], subs: [] }; }
     var lines = t.split(/\r?\n/), vars = [], subs = [], audios = [], i, j;
     var embedded = [];            // ana listedeki yerleşik altyazı satırları (adı / dili / adresi)
     var subPlaylists = [];        // altyazı oynatma listeleri (.m3u8): tek parçalıysa doğrudan .vtt adresi çıkarılır
@@ -757,7 +757,7 @@ function buildStreams(found, pageUrl, label) {
   var subsAll = found.subs.slice(), items = [];
   var hlsJobs = found.hls.slice(0, 3).map(function (u) {
     return inspectHls(u, ref, originOf(pageUrl) + '/').then(function (x) {
-      x.list.forEach(function (it) { items.push({ hh: x.ref, url: it.url, quality: it.quality, ses: it.ses, seslist: it.seslist, native: it.native, subnames: it.subnames, src: u }); });
+      x.list.forEach(function (it) { items.push({ bad: it.bad, hh: x.ref, url: it.url, quality: it.quality, ses: it.ses, seslist: it.seslist, native: it.native, subnames: it.subnames, src: u }); });
       subsAll = subsAll.concat(x.subs);
       guessVtt(u).concat((x.variants || []).slice(0, 1).reduce(function (a, v) { return a.concat(guessVtt(v)); }, [])).forEach(function (g) { subsAll.push(g); });
     });
@@ -787,6 +787,11 @@ function buildStreams(found, pageUrl, label) {
       lists.forEach(function (l) { l.forEach(function (x) { fin.push(x); }); });
       good = fin;
       var seen = {};
+      // çalışmayan (liste inmeyen) ve çözünürlüğü bilinmeyen "Auto" akışlar, çalışan akış varken gösterilmez
+      var okItems = items.filter(function (it) { return !it.bad; });
+      if (okItems.length) items = okItems;
+      var resolved = items.filter(function (it) { return it.quality !== 'Auto'; });
+      if (resolved.length) items = resolved;
       return items.filter(function (it) { if (seen[it.url]) return false; seen[it.url] = true; return true; }).map(function (it) {
         var parts = ['Dizipal', it.mp4 ? 'MP4' : 'HLS'];
         if (it.ses) parts.push('Ses ' + it.ses);
@@ -809,7 +814,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.11'];
+  dbg = ['dizipal v1.3.12'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
