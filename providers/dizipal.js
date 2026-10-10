@@ -416,8 +416,14 @@ function inspectHls(url, ref) {
 // /hls2/01/00009/<kod>_h/...  ->  /vtt/01/00009/<kod>_tur.vtt
 function guessVtt(u) {
   var m = String(u).match(/^(https?:\/\/[^\/]+)\/hls\d*\/(\d+)\/(\d+)\/([a-z0-9]+)_[^\/]*\//i);
-  if (!m) return [];
-  return ['tur', 'tr', 'eng'].map(function (l) { return mkSub(m[1] + '/vtt/' + m[2] + '/' + m[3] + '/' + m[4] + '_' + l + '.vtt', l); });
+  var out = [];
+  if (m) out = ['tur', 'tr', 'eng'].map(function (l) { return mkSub(m[1] + '/vtt/' + m[2] + '/' + m[3] + '/' + m[4] + '_' + l + '.vtt', l); });
+  // klasör içi genel tahminler: <klasör>/tur.vtt, <üst klasör>/tur.vtt
+  var d1 = String(u).replace(/[?#].*$/, '').replace(/\/[^\/]*$/, ''), d2 = d1.replace(/\/[^\/]*$/, '');
+  if (/^https?:\/\/[^\/]+\/./.test(d1)) {
+    [d1, d2].forEach(function (d) { if (/^https?:\/\/[^\/]+\/./.test(d)) ['tur', 'tr'].forEach(function (l) { out.push(mkSub(d + '/' + l + '.vtt', l)); }); });
+  }
+  return out;
 }
 function verifySub(s, ref) {
   return fetchInfo(s.url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true).then(function (r) { var ok = r.status === 200 && /^\s*WEBVTT/.test(r.text || ''); dbg.push('altyazi ' + s.lang + ' ' + (r.status || r.err) + (ok ? ' ok' : ' yok')); return ok ? s : null; });
@@ -522,6 +528,25 @@ function parseConfigResp(r, tag) {
   var c = o.config || {};
   if (o.enc) { var v = decryptEnc(o.enc); dbg.push(tag + ' sifre ' + (v ? 'ok' : 'COZULEMEDI')); if (v) c.v = v; }
   if (!c.v) { dbg.push(tag + ' ' + (r.status || r.err) + ' ' + JSON.stringify(o).slice(0, 110)); return null; }
+  // yanıtın tamamında (config alanları + çözülen metin) altyazı ara: tracks / subtitle / sub / captions ...
+  try {
+    var extra = [r.text, o.enc ? String(c.v) : '', JSON.stringify(c)];
+    var more = deepTexts(extra);
+    c._subs = [];
+    extra.concat(more).forEach(function (tx) { scanText(tx, '').subs.forEach(function (sb) { if (!c._subs.some(function (q) { return q.url === sb.url; })) c._subs.push(sb); }); });
+    Object.keys(o).concat(Object.keys(c)).forEach(function (k) {
+      if (!/^(sub|subs|subtitle|subtitles|tracks|captions|cc|altyazi|vtt)$/i.test(k)) return;
+      var val = o[k] !== undefined ? o[k] : c[k];
+      var list = Array.isArray(val) ? val : [val];
+      list.forEach(function (x) {
+        var u = typeof x === 'string' ? x : (x && (x.file || x.url || x.src)) || '';
+        var lb = (x && typeof x === 'object') ? (x.label || x.lang || x.language || x.srclang || '') : '';
+        u = fixUrl(u);
+        if (/^https?:/i.test(u) && !c._subs.some(function (q) { return q.url === u; })) c._subs.push(mkSub(u, lb));
+      });
+    });
+    if (c._subs.length) dbg.push(tag + ' altyazi ' + c._subs.length + ' ' + c._subs[0].url.slice(0, 80));
+  } catch (e) {}
   dbg.push(tag + ' oyuncu t=' + (c.t || 'embed') + ' ' + String(c.v).slice(0, 100));
   return c;
 }
@@ -561,10 +586,10 @@ function getPlayerConfig(html, base, pageUrl, pageCookie) {
   });
 }
 function configTargets(c, base) {
-  var t = String(c.t || 'embed').toLowerCase(), v = String(c.v || ''), res = { embeds: [], direct: null }, u;
+  var t = String(c.t || 'embed').toLowerCase(), v = String(c.v || ''), res = { embeds: [], direct: null, subs: (c._subs || []).slice() }, u;
   if (t === 'm3u8' || t === 'mp4') {
     u = fixUrl(v);
-    res.direct = { hls: t === 'm3u8' ? [u] : [], mp4: t === 'mp4' ? [u] : [], subs: [], origin: base };
+    res.direct = { hls: t === 'm3u8' ? [u] : [], mp4: t === 'mp4' ? [u] : [], subs: (c._subs || []).slice(), origin: base };
   } else if (v.indexOf('<iframe') > -1) {
     var m = v.match(/<iframe[^>]+src=["']([^"']+)["']/i);
     if (m) res.embeds = [fixUrl(m[1]).split('#')[0]];
@@ -599,11 +624,19 @@ function buildStreams(found, pageUrl, label) {
     subsAll.forEach(function (s) { if (!seenS[s.url]) { seenS[s.url] = true; subs.push(s); } });
     var verify = AYAR.ALTYAZI ? subs.map(function (s) {
       // sayfadan/ana listeden gelenler zaten gerçek; sadece tahmin edilenleri doğrula
-      var guessed = /\/vtt\/\d+\/\d+\/[a-z0-9]+_[a-z]{2,3}\.vtt/i.test(s.url) && found.subs.every(function (f) { return f.url !== s.url; });
+      var guessed = (/\/vtt\/\d+\/\d+\/[a-z0-9]+_[a-z]{2,3}\.vtt/i.test(s.url) || /\/(?:tur|tr)\.vtt$/i.test(s.url)) && found.subs.every(function (f) { return f.url !== s.url; });
       return guessed ? verifySub(s, ref).catch(function () { return null; }) : Promise.resolve(s);
     }) : [];
     return Promise.all(verify).then(function (vs) {
-      var good = vs.filter(Boolean).sort(function (a, b) { return (a.lang === 'tur' ? 0 : 1) - (b.lang === 'tur' ? 0 : 1); });
+      var good = vs.filter(Boolean);
+      // Nuvio'da "Bilinmiyor" görünmesin: dili anlaşılamayan altyazı, Türkçe parça yoksa Türkçe sayılır (Dizipal'ın yerleşik altyazısı Türkçe)
+      var hasTur = good.some(function (g) { return g.lang === 'tur'; });
+      good = good.map(function (g) {
+        if (g.lang === 'und' && !hasTur) { hasTur = true; return { url: g.url, lang: 'tur', label: 'Türkçe' }; }
+        if (g.lang === 'und') return { url: g.url, lang: 'und', label: 'Altyazı' };
+        return g;
+      }).sort(function (a, b) { return (a.lang === 'tur' ? 0 : 1) - (b.lang === 'tur' ? 0 : 1); });
+      dbg.push('altyazi sonuc ' + good.map(function (g) { return g.lang + ':' + g.url.slice(-40); }).join(' | '));
       var seen = {};
       return items.filter(function (it) { if (seen[it.url]) return false; seen[it.url] = true; return true; }).map(function (it) {
         var parts = ['Dizipal', it.mp4 ? 'MP4' : 'HLS'];
@@ -614,7 +647,7 @@ function buildStreams(found, pageUrl, label) {
         if (good.length) parts.push(good.some(function (g) { return g.lang === 'tur'; }) ? 'TR Altyazı' : 'Altyazı');
         var st = { name: AYAR.EKLENTI_ADI, title: parts.join(' | '), url: it.url, quality: it.quality, headers: headers, provider: PROVIDER_ID };
         if (it.mp4) st.type = 'mp4';
-        if (good.length) st.subtitles = good.map(function (s) { return { url: s.url, lang: s.lang, label: s.label, id: s.lang }; });
+        if (good.length) st.subtitles = good.map(function (s) { return { url: s.url, lang: s.lang, language: s.lang === 'tur' ? 'Turkish' : s.lang, label: s.label, name: s.label, id: s.lang, kind: 'subtitles' }; });
         return st;
       });
     });
@@ -625,7 +658,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.4'];
+  dbg = ['dizipal v1.3.5'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
@@ -679,8 +712,16 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
           return getPlayerConfig(html, base, pageUrl, r.cookie || '').then(function (cfg) {
             var t = cfg ? configTargets(cfg, base) : { embeds: [], direct: null };
             if (!t.embeds.length && !t.direct) t.embeds = findEmbeds(html);
-            dbg.push('player embed=' + t.embeds.length + (t.direct ? ' direct' : ''));
-            if (t.embeds.length || t.direct) pages[i] = { url: pageUrl, embeds: t.embeds, direct: t.direct };
+            // sayfanın kendisinde de altyazı ara (data-cfg çözümü, gömülü JSON, tracks ...)
+            var pageSubs = (t.subs || []).slice();
+            try {
+              var cfgM = html.match(/data-cfg=["']([^"']+)["']/i);
+              var pt = [html].concat(cfgM ? [decodeHtml(cfgM[1])] : []);
+              pt = pt.concat(deepTexts(pt));
+              pt.forEach(function (tx) { scanText(tx, base).subs.forEach(function (sb) { if (!pageSubs.some(function (q) { return q.url === sb.url; })) pageSubs.push(sb); }); });
+            } catch (e) {}
+            dbg.push('player embed=' + t.embeds.length + (t.direct ? ' direct' : '') + ' sayfaAltyazi=' + pageSubs.length);
+            if (t.embeds.length || t.direct) pages[i] = { url: pageUrl, embeds: t.embeds, direct: t.direct, subs: pageSubs };
           });
         });
       });
@@ -692,9 +733,11 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
         var ej = pg.embeds.slice(0, AYAR.MAX_EMBED).map(function (e, i) {
           return resolveEmbed(e, pg.url, 0).then(function (found) {
             if (!found.hls.length && !found.mp4.length) return;
+            found.subs = found.subs.concat(pg.subs || []);          // player ayarı / sayfadan gelen altyazılar
             return buildStreams(found, pg.url).then(function (st) { results[i] = st; });
           });
         });
+        if (pg.direct) pg.direct.subs = (pg.direct.subs || []).concat(pg.subs || []);
         if (pg.direct) ej.push(buildStreams(pg.direct, pg.url).then(function (st) { results[99] = st; }));
         return waitWithin(ej, AYAR.SUNUCU_SURESI + 3000).then(function () {
           var streams = [], seen = {};
