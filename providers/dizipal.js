@@ -7,7 +7,7 @@
 var AYAR = {
   SITELER: ['https://dizipal2138.com', 'https://dizipal2139.com'],   // adres değişirse sıradakine geçer
   EKLENTI_ADI: 'Dizipal',
-  DEBUG_MODU: false,    // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
+  DEBUG_MODU: true,     // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
   MAX_ADAY: 3,          // en fazla kaç aday dizi/film sayfası denensin
   MAX_SORGU: 3,         // en fazla kaç arama yapılsın
   MAX_EMBED: 3,         // en fazla kaç player (embed) çözülsün
