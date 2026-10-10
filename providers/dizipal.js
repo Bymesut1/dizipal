@@ -245,16 +245,67 @@ function deepTexts(texts) {
   });
   return out;
 }
+
+// ---- XOR + base64 şifreli player adresi ----
+// Embed sayfası: var _x=function(e){var k="ANAHTAR",r="",d=atob(e);for(...)r+=String.fromCharCode(d.charCodeAt(i)^k.charCodeAt(i%k.length));return r;}
+//                jwplayer("vplayer").setup({sources:[{file:_x("BASE64...")}] ...
+function b64bin(s) {
+  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+\/]/g, '');
+  var bytes = [], bits = 0, val = 0, i;
+  for (i = 0; i < s.length; i++) {
+    val = ((val << 6) | C.indexOf(s.charAt(i))) & 0xffffff;
+    bits += 6;
+    if (bits >= 8) { bits -= 8; bytes.push((val >> bits) & 255); }
+  }
+  return bytes;
+}
+function xorDecode(b64, key) {
+  var b = b64bin(b64), r = '', i;
+  for (i = 0; i < b.length; i++) r += String.fromCharCode(b[i] ^ key.charCodeAt(i % key.length));
+  return r;
+}
+function xorTexts(t) {
+  t = String(t || '');
+  var out = [], keys = [], names = {}, m;
+  var reF = /(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*function\s*\(\s*\w+\s*\)\s*\{\s*var\s+\w+\s*=\s*(["'])([^"']{3,64})\2/g;
+  while ((m = reF.exec(t)) !== null) { names[m[1]] = m[3]; keys.push(m[3]); }
+  var reD = /function\s+([A-Za-z_$][\w$]*)\s*\(\s*\w+\s*\)\s*\{\s*var\s+\w+\s*=\s*(["'])([^"']{3,64})\2/g;
+  while ((m = reD.exec(t)) !== null) { names[m[1]] = m[3]; keys.push(m[3]); }
+  var reK = /(?:var|let|const)\s+\w+\s*=\s*(["'])([A-Za-z0-9]{6,24})\1/g;
+  while ((m = reK.exec(t)) !== null) keys.push(m[2]);
+  keys = uniq(keys);
+  var reC = /([A-Za-z_$][\w$]*)\s*\(\s*(["'])([A-Za-z0-9+\/=_-]{24,})\2\s*\)/g;
+  while ((m = reC.exec(t)) !== null) {
+    var fn = m[1], data = m[3];
+    var tryKeys = names[fn] ? [names[fn]] : keys.slice(0, 8);
+    tryKeys.forEach(function (k) {
+      var d = xorDecode(data, k);
+      if (/^\s*https?:\/\/[\x21-\x7e]+/.test(d) || /https?:\/\/|\.m3u8|\.mp4|\.vtt|"file"|sources/i.test(d)) out.push(d);
+    });
+  }
+  return uniq(out);
+}
+
 function resolveEmbed(embedUrl, pageUrl, depth) {
   var origin = originOf(embedUrl);
   return fetchInfo(embedUrl, hdr(pageUrl), true).then(function (r) {
     var texts = [r.text || ''].concat(unpackAll(r.text || ''));
     texts = texts.concat(deepTexts(texts));
+    var xored = [];
+    texts.slice().forEach(function (x) { xorTexts(x).forEach(function (d) { if (xored.indexOf(d) === -1) xored.push(d); }); });
+    texts = texts.concat(xored);
     var found = { hls: [], mp4: [], subs: [], origin: origin };
     texts.forEach(function (t) {
       var s = scanText(t, origin);
       found.hls = found.hls.concat(s.hls); found.mp4 = found.mp4.concat(s.mp4); found.subs = found.subs.concat(s.subs);
     });
+    // şifresi çözülen düz adres (.m3u8 uzantısı olmasa da) HLS sayılır
+    xored.forEach(function (d) {
+      var u = (d.match(/^\s*(https?:\/\/[^\s"'<>\\]+)/) || [])[1];
+      if (u && found.hls.indexOf(u) === -1 && found.mp4.indexOf(u) === -1 && !/\.(?:vtt|srt)(?:\?|$)/i.test(u)) found.hls.push(u);
+    });
+    if (xored.length) dbg.push('sifre cozuldu ' + xored.length + ' ' + xored[0].slice(0, 90));
     found.hls = uniq(found.hls); found.mp4 = uniq(found.mp4);
     dbg.push('embed ' + hostOf(embedUrl) + ' ' + (r.status || r.err) + ' ' + (r.text || '').length + 'b hls=' + found.hls.length + ' mp4=' + found.mp4.length + ' altyazi=' + found.subs.length);
     if (!found.hls.length && !found.mp4.length) {
@@ -519,7 +570,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.0'];
+  dbg = ['dizipal v1.3.1'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
@@ -612,7 +663,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { getStreams: getStreams, _t: { parseSearch: parseSearch, findEmbeds: findEmbeds, unpackAll: unpackAll, scanText: scanText, b64d: b64d } };
+  module.exports = { getStreams: getStreams, _t: { xorTexts: xorTexts, xorDecode: xorDecode, resolveEmbed: resolveEmbed, parseSearch: parseSearch, findEmbeds: findEmbeds, unpackAll: unpackAll, scanText: scanText, b64d: b64d } };
 } else {
   global.getStreams = getStreams;
 }
