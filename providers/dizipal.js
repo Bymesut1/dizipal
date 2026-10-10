@@ -216,6 +216,11 @@ function scanText(t, origin) {
   while ((m = re.exec(t)) !== null) push(res.hls, m[0]);
   var reRel = /["'](\/[^"'\s]+?\.m3u8[^"'\s]*)["']/gi;
   while ((m = reRel.exec(t)) !== null) push(res.hls, origin + m[1]);
+  // uzantısız HLS adresi (imagestoo vb.): https://host/m3/<şifreli-token>  (bu adres Referer olmadan "security error" verir)
+  var reM3 = /https?:\/\/[^\s"'<>\\)]+?\/m3\/[A-Za-z0-9+\/=_%\-.]{24,}/gi;
+  while ((m = reM3.exec(t)) !== null) push(res.hls, m[0]);
+  var reM3r = /["'`](\/m3\/[A-Za-z0-9+\/=_%\-.]{24,})["'`]/gi;
+  while ((m = reM3r.exec(t)) !== null) push(res.hls, origin + m[1]);
   var re2 = /https?:\/\/[^\s"'<>\\)]+?\.mp4(?:\?[^\s"'<>\\)]*)?/gi;
   while ((m = re2.exec(t)) !== null) push(res.mp4, m[0]);
   var re3 = /https?:\/\/[^\s"'<>\\)]+?\.(?:vtt|srt)(?:\?[^\s"'<>\\)]*)?/gi;
@@ -352,7 +357,7 @@ function resolveEmbed(embedUrl, pageUrl, depth) {
 }
 function qualOf(h) { return h ? h + 'p' : 'Auto'; }
 // Ana liste (master): ses seçenekleri, kalite varyantları ve yerleşik altyazı satırları
-function inspectHls(url, ref) {
+function inspectHls1(url, ref) {
   return fetchInfo(url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true).then(function (r) {
     var t = r.text || '', base = r.url || url;
     if (AYAR.DEBUG_MODU) dumpLong('hM', t.replace(/https?:\/\/[^\s"']+\//g, '…/'), 110, 7);
@@ -412,6 +417,17 @@ function inspectHls(url, ref) {
       });
     });
     return waitWithin(spj, 3500).then(function () { return sres; });
+  });
+}
+// Liste yalnızca doğru Referer ile iniyorsa (embed sitesi / Dizipal sayfası) çalışan Referer'i bulur
+function inspectHls(url, ref, alt) {
+  function probe(r0) { return fetchInfo(url, hdr(r0, { 'Origin': String(r0).replace(/\/$/, '') }), true); }
+  return probe(ref).then(function (r) {
+    if ((r.text || '').indexOf('#EXTM3U') > -1 || !alt || alt === ref) return inspectHls1(url, ref);
+    return probe(alt).then(function (r2) {
+      if ((r2.text || '').indexOf('#EXTM3U') > -1) { dbg.push('hls referer=alt'); return inspectHls1(url, alt).then(function (x) { x.ref = alt; return x; }); }
+      return inspectHls1(url, ref);
+    });
   });
 }
 // /hls2/01/00009/<kod>_h/...  ->  /vtt/01/00009/<kod>_tur.vtt
@@ -700,8 +716,8 @@ function buildStreams(found, pageUrl, label) {
   var headers = { 'User-Agent': UA, 'Referer': ref, 'Origin': ref.replace(/\/$/, '') };
   var subsAll = found.subs.slice(), items = [];
   var hlsJobs = found.hls.slice(0, 3).map(function (u) {
-    return inspectHls(u, ref).then(function (x) {
-      x.list.forEach(function (it) { items.push({ url: it.url, quality: it.quality, ses: it.ses, seslist: it.seslist, native: it.native, subnames: it.subnames, src: u }); });
+    return inspectHls(u, ref, originOf(pageUrl) + '/').then(function (x) {
+      x.list.forEach(function (it) { items.push({ hh: x.ref, url: it.url, quality: it.quality, ses: it.ses, seslist: it.seslist, native: it.native, subnames: it.subnames, src: u }); });
       subsAll = subsAll.concat(x.subs);
       guessVtt(u).concat((x.variants || []).slice(0, 1).reduce(function (a, v) { return a.concat(guessVtt(v)); }, [])).forEach(function (g) { subsAll.push(g); });
     });
@@ -738,7 +754,8 @@ function buildStreams(found, pageUrl, label) {
         if (it.native) parts.push('Yerleşik altyazı' + (it.subnames ? ': ' + it.subnames : ''));
         parts.push(it.quality);
         if (good.length) parts.push(good.some(function (g) { return g.lang === 'tur'; }) ? 'TR Altyazı' : 'Altyazı');
-        var st = { name: AYAR.EKLENTI_ADI + (AYAR.DEBUG_MODU ? ' [altyazi: ' + (subNote || (good.length ? '?' : 'yok')) + ']' : ''), title: parts.join(' | '), url: it.url, quality: it.quality, headers: headers, provider: PROVIDER_ID };
+        var hd = it.hh ? { 'User-Agent': UA, 'Referer': it.hh, 'Origin': it.hh.replace(/\/$/, '') } : headers;
+        var st = { name: AYAR.EKLENTI_ADI + (AYAR.DEBUG_MODU ? ' [altyazi: ' + (subNote || (good.length ? '?' : 'yok')) + ']' : ''), title: parts.join(' | '), url: it.url, quality: it.quality, headers: hd, provider: PROVIDER_ID };
         if (it.mp4) st.type = 'mp4';
         if (good.length) st.subtitles = good.map(function (s, i) { return { url: s.url, lang: s.lang, language: s.lang === 'tur' ? 'Turkish' : s.lang, label: s.label, name: s.label, id: s.lang + (i ? i : ''), kind: 'subtitles', headers: (s.inline || !s.withHeaders) ? undefined : headers }; });
         return st;
@@ -752,7 +769,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.7'];
+  dbg = ['dizipal v1.3.9'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
