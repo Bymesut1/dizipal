@@ -15,7 +15,7 @@ var AYAR = {
   ALTYAZI: true,        // yerleşik altyazıları bul
   ARAMA_SURESI: 5000,   // ms
   SUNUCU_SURESI: 6000,  // ms
-  GENEL_SURE: 12000     // ms
+  GENEL_SURE: 24000     // ms
 };
 
 var TMDB_KEY = '000316508321ce461cf81e7c6815eec7';
@@ -168,7 +168,7 @@ function findEmbeds(html) {
     u = fixUrl(u);
     if (!/^https?:/i.test(u) || seen[u]) return;
     if (/google|youtube|facebook|twitter|blogger|googletagmanager|cloudflare|shrgo|t\.ly|bit\.ly|cutt\.ly|sivo\.|rebrand|gshort|girgara|rogagir/i.test(hostOf(u))) return;
-    if (AYAR.SITELER.some(function (s) { return hostOf(s) === hostOf(u); }) && u.replace(/^https?:\/\/[^\/]+/, '').length < 2) return;
+    if (AYAR.SITELER.some(function (s) { return hostOf(s) === hostOf(u); })) return;
     seen[u] = true; out.push(u);
   }
   function scan(t) {
@@ -176,8 +176,6 @@ function findEmbeds(html) {
     while ((mm = re.exec(t)) !== null) add(mm[1]);
     var re2 = /https?:\\?\/\\?\/[a-z0-9.\-]+\\?\/(?:embed-|embed\/|e\/|v\/)[A-Za-z0-9_\-]+(?:\.html)?/gi;
     while ((mm = re2.exec(t)) !== null) add(mm[0]);
-    var re4 = /(?:data-[a-z\-]+|src|href|value)=["']((?:https?:)?\/\/[^"'\s]+?)["']/gi;
-    while ((mm = re4.exec(t)) !== null) { if (/player|embed|iframe|\/e\/|\/v\/|vidmoly|filemoon|streamtape|dood|upstream|mixdrop|sibnet|hls/i.test(mm[1]) && !/\.(?:js|css|png|jpe?g|webp|gif|svg|ico|woff2?)(?:\?|$)/i.test(mm[1])) add(mm[1]); }
   }
   html = String(html || '');
   scan(html);
@@ -230,6 +228,11 @@ function resolveEmbed(embedUrl, pageUrl, depth) {
     });
     found.hls = uniq(found.hls); found.mp4 = uniq(found.mp4);
     dbg.push('embed ' + hostOf(embedUrl) + ' ' + (r.status || r.err) + ' ' + (r.text || '').length + 'b hls=' + found.hls.length + ' mp4=' + found.mp4.length + ' altyazi=' + found.subs.length);
+    if (!found.hls.length && !found.mp4.length) {
+      var all = texts.join(' '), ki = all.search(/sources|file\s*:|\.m3u8|hls/i);
+      dbg.push('embedhtml ' + (r.text || '').length + 'b paket=' + (texts.length - 1) + ' ' + String(r.text || '').slice(0, 90).replace(/\s+/g, ' '));
+      if (ki > -1) dumpLong('zE', all.slice(Math.max(0, ki - 80), ki + 320), 100, 4);
+    }
     if (!found.hls.length && !found.mp4.length && (depth || 0) < 1) {     // iç içe iframe
       var inner = findEmbeds(r.text || '');
       if (inner.length) return resolveEmbed(inner[0], embedUrl, 1);
@@ -240,7 +243,7 @@ function resolveEmbed(embedUrl, pageUrl, depth) {
 function qualOf(h) { return h ? h + 'p' : 'Auto'; }
 // Ana liste (master) mı? Ses sırasına göre varyant seç, yerleşik altyazı satırlarını al
 function inspectHls(url, ref) {
-  return fetchInfo(url, hdr(ref), true).then(function (r) {
+  return fetchInfo(url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true).then(function (r) {
     var t = r.text || '', base = r.url || url;
     if (t.indexOf('#EXT-X-STREAM-INF') === -1) return { list: [{ url: url, quality: 'Auto' }], subs: [] };
     var lines = t.split(/\r?\n/), vars = [], subs = [], i, j;
@@ -278,13 +281,147 @@ function guessVtt(u) {
   return ['tur', 'eng'].map(function (l) { return mkSub(m[1] + '/vtt/' + m[2] + '/' + m[3] + '/' + m[4] + '_' + l + '.vtt', l); });
 }
 function verifySub(s, ref) {
-  return fetchInfo(s.url, hdr(ref), true).then(function (r) { return (r.status === 200 && /^\s*WEBVTT/.test(r.text || '')) ? s : null; });
+  return fetchInfo(s.url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true).then(function (r) { return (r.status === 200 && /^\s*WEBVTT/.test(r.text || '')) ? s : null; });
+}
+
+
+// ---------------- Oyuncu ayarı: /ajax-player-config (AES-CBC, anahtar = k1 XOR k2) ----------------
+function b64bytes(s) {
+  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+\/]/g, '');
+  var out = [], bits = 0, val = 0, i;
+  for (i = 0; i < s.length; i++) {
+    val = ((val << 6) | C.indexOf(s.charAt(i))) & 0xffffff;
+    bits += 6;
+    if (bits >= 8) { bits -= 8; out.push((val >> bits) & 255); }
+  }
+  return out;
+}
+var AES = { sb: null, isb: null };
+function aesInit() {
+  if (AES.sb) return;
+  var sb = new Array(256), isb = new Array(256), p = 1, q = 1, x;
+  function rotl(v, n) { return ((v << n) | (v >> (8 - n))) & 255; }
+  do {
+    p = (p ^ ((p << 1) & 255) ^ ((p & 0x80) ? 0x1b : 0)) & 255;
+    q ^= (q << 1) & 255; q ^= (q << 2) & 255; q ^= (q << 4) & 255; if (q & 0x80) q ^= 0x09;
+    x = q ^ rotl(q, 1) ^ rotl(q, 2) ^ rotl(q, 3) ^ rotl(q, 4);
+    sb[p] = (x ^ 0x63) & 255;
+  } while (p !== 1);
+  sb[0] = 0x63;
+  for (x = 0; x < 256; x++) isb[sb[x]] = x;
+  AES.sb = sb; AES.isb = isb;
+}
+function gmul(a, b) { var r = 0; while (b) { if (b & 1) r ^= a; a = ((a << 1) ^ ((a & 0x80) ? 0x11b : 0)) & 255; b >>= 1; } return r; }
+function aesCbcDecrypt(key, iv, data) {
+  aesInit();
+  var sb = AES.sb, isb = AES.isb, nk = key.length / 4;
+  if (nk !== 4 && nk !== 6 && nk !== 8) return null;
+  if (!data.length || data.length % 16 || iv.length !== 16) return null;
+  var nr = nk + 6, w = key.slice(), i, j, r, c, t, rcon = 1;
+  for (i = nk; i < 4 * (nr + 1); i++) {
+    t = [w[4 * i - 4], w[4 * i - 3], w[4 * i - 2], w[4 * i - 1]];
+    if (i % nk === 0) { t = [sb[t[1]] ^ rcon, sb[t[2]], sb[t[3]], sb[t[0]]]; rcon = ((rcon << 1) ^ ((rcon & 0x80) ? 0x11b : 0)) & 255; }
+    else if (nk > 6 && i % nk === 4) t = [sb[t[0]], sb[t[1]], sb[t[2]], sb[t[3]]];
+    for (j = 0; j < 4; j++) w[4 * i + j] = w[4 * (i - nk) + j] ^ t[j];
+  }
+  var out = [], prev = iv.slice(), off, blk, s, u, a0, a1, a2, a3;
+  for (off = 0; off < data.length; off += 16) {
+    blk = data.slice(off, off + 16); s = blk.slice();
+    for (j = 0; j < 16; j++) s[j] ^= w[16 * nr + j];
+    for (r = nr - 1; r >= 0; r--) {
+      u = s.slice();
+      for (c = 0; c < 4; c++) for (j = 0; j < 4; j++) s[4 * c + j] = u[4 * ((c - j + 4) % 4) + j];
+      for (j = 0; j < 16; j++) s[j] = isb[s[j]];
+      for (j = 0; j < 16; j++) s[j] ^= w[16 * r + j];
+      if (r > 0) {
+        for (c = 0; c < 4; c++) {
+          a0 = s[4 * c]; a1 = s[4 * c + 1]; a2 = s[4 * c + 2]; a3 = s[4 * c + 3];
+          s[4 * c]     = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
+          s[4 * c + 1] = gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13);
+          s[4 * c + 2] = gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11);
+          s[4 * c + 3] = gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14);
+        }
+      }
+    }
+    for (j = 0; j < 16; j++) out.push(s[j] ^ prev[j]);
+    prev = blk;
+  }
+  var pad = out[out.length - 1];
+  if (!(pad >= 1 && pad <= 16)) return null;
+  out.length -= pad;
+  return out;
+}
+function bytesToStr(b) {
+  try { return decodeURIComponent(b.map(function (x) { return '%' + ('0' + x.toString(16)).slice(-2); }).join('')); }
+  catch (e) { return b.map(function (x) { return String.fromCharCode(x); }).join(''); }
+}
+function decryptEnc(enc) {
+  try {
+    var k1 = b64bytes(enc.k1), k2 = b64bytes(enc.k2), iv = b64bytes(enc.iv), ct = b64bytes(enc.c), n = Math.min(k1.length, k2.length), key = [], i;
+    for (i = 0; i < n; i++) key.push(k1[i] ^ k2[i]);
+    var plain = aesCbcDecrypt(key, iv, ct);
+    if (!plain && n > 32) plain = aesCbcDecrypt(key.slice(0, 32), iv, ct);
+    return plain ? bytesToStr(plain) : null;
+  } catch (e) { return null; }
+}
+function postForm(url, body, headers) {
+  return withTimeout(fetch(url, { method: 'POST', headers: headers, body: body }), AYAR.SUNUCU_SURESI).then(function (res) {
+    return withTimeout(res.text(), 6000).then(
+      function (t) { return { status: res.status, text: t || '' }; },
+      function () { return { status: res.status, text: '' }; });
+  }).catch(function (e) { return { status: 0, text: '', err: (e && e.message) || 'hata' }; });
+}
+function dumpLong(tag, str, size, max) {
+  str = String(str || '').replace(/\s+/g, ' ');
+  for (var i = 0; i < max && i * size < str.length; i++) dbg.push(tag + (i + 1) + ' ' + str.substr(i * size, size));
+}
+// Sayfadaki #videoContainer[data-cfg] -> POST /ajax-player-config -> { t, v, p }
+function getPlayerConfig(html, base, pageUrl) {
+  html = String(html || '');
+  var tag = html.match(/<[^>]*id=["']videoContainer["'][^>]*>/i);
+  var cm = (tag && tag[0].match(/data-cfg=["']([^"']+)["']/i)) || html.match(/data-cfg=["']([^"']+)["']/i);
+  if (!cm) { dbg.push('cfg yok'); return Promise.resolve(null); }
+  var cfg = decodeHtml(cm[1]);
+  var h = hdr(pageUrl, {
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'X-Requested-With': 'XMLHttpRequest', 'Origin': base,
+    'Accept': 'application/json, text/javascript, */*; q=0.01'
+  });
+  return postForm(base + '/ajax-player-config', 'cfg=' + encodeURIComponent(cfg), h).then(function (r) {
+    var o = null; try { o = JSON.parse(r.text); } catch (e) {}
+    dbg.push('config ' + (r.status || r.err) + ' ' + r.text.length + 'b ' + (o ? Object.keys(o).join(',') : r.text.slice(0, 90)));
+    if (!o) return null;
+    var c = o.config || {};
+    if (o.enc) {
+      var v = decryptEnc(o.enc);
+      dbg.push('sifre ' + (v ? 'ok ' + v.length + 'b' : 'COZULEMEDI'));
+      if (v) c.v = v;
+    }
+    if (!c.v) return null;
+    dbg.push('oyuncu t=' + (c.t || 'embed') + ' ' + String(c.v).slice(0, 100));
+    return c;
+  });
+}
+function configTargets(c, base) {
+  var t = String(c.t || 'embed').toLowerCase(), v = String(c.v || ''), res = { embeds: [], direct: null }, u;
+  if (t === 'm3u8' || t === 'mp4') {
+    u = fixUrl(v);
+    res.direct = { hls: t === 'm3u8' ? [u] : [], mp4: t === 'mp4' ? [u] : [], subs: [], origin: base };
+  } else if (v.indexOf('<iframe') > -1) {
+    var m = v.match(/<iframe[^>]+src=["']([^"']+)["']/i);
+    if (m) res.embeds = [fixUrl(m[1]).split('#')[0]];
+  } else {
+    u = fixUrl(v).split('#')[0];
+    if (/^https?:/i.test(u)) res.embeds = [u];
+  }
+  return res;
 }
 
 // ---------------- Ana akış ----------------
 function debugStream(msg) {
   if (!AYAR.DEBUG_MODU) return [];
-  return [msg].concat(dbg.slice(0, 40)).map(function (r) {
+  return [msg].concat(dbg.slice(0, 60)).map(function (r) {
     return { name: 'DEBUG ' + r, title: 'DEBUG ' + r, url: 'https://debug.invalid/', quality: 'Auto', provider: PROVIDER_ID };
   });
 }
@@ -329,7 +466,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.0.1'];
+  dbg = ['dizipal v1.1.0'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
@@ -377,23 +514,18 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
       var pj = ranked.map(function (x, i) {
         var path = isTv ? '/bolum/' + x.c.path.replace('/dizi/', '') + '-' + season + '-sezon-' + episode + '-bolum' : x.c.path;
         return fetchSite(path).then(function (r) {
-          var embeds = r.status === 200 ? findEmbeds(r.text) : [];
-          dbg.push('sayfa ' + path + ' ' + (r.status || r.err) + ' embed=' + embeds.length);
-          if (!embeds.length && r.text) {
-            var tx = r.text, ifr = [], mi, rei = /<iframe[^>]*>/gi;
-            while ((mi = rei.exec(tx)) !== null && ifr.length < 3) ifr.push(mi[0].slice(0, 140));
-            dbg.push('html ' + tx.length + 'b iframe=' + ifr.length + ' ' + ifr.join(' ~ '));
-            var kw = ['player', 'embed', 'data-src', 'atob(', 'ajax', 'nonce', 'm3u8', 'sources', 'video'].map(function (k) { return k + ':' + (tx.split(k).length - 1); });
-            dbg.push('kelime ' + kw.join(' '));
-            var pi = tx.search(/player|embed/i);
-            if (pi > -1) dbg.push('iz ' + tx.slice(Math.max(0, pi - 60), pi + 160).replace(/\s+/g, ' '));
-            var ti = tx.match(/<title>([^<]{0,80})/i);
-            if (ti) dbg.push('baslik ' + ti[1]);
-          }
-          if (embeds.length) pages[i] = { url: (r.base || AYAR.SITELER[0]) + path, embeds: embeds };
+          var base = r.base || AYAR.SITELER[0], pageUrl = base + path, html = r.status === 200 ? (r.text || '') : '';
+          dbg.push('sayfa ' + path + ' ' + (r.status || r.err) + ' ' + html.length + 'b');
+          if (!html) return;
+          return getPlayerConfig(html, base, pageUrl).then(function (cfg) {
+            var t = cfg ? configTargets(cfg, base) : { embeds: [], direct: null };
+            if (!t.embeds.length && !t.direct) t.embeds = findEmbeds(html);
+            dbg.push('player embed=' + t.embeds.length + (t.direct ? ' direct' : ''));
+            if (t.embeds.length || t.direct) pages[i] = { url: pageUrl, embeds: t.embeds, direct: t.direct };
+          });
         });
       });
-      return waitWithin(pj, AYAR.ARAMA_SURESI).then(function () {
+      return waitWithin(pj, 10000).then(function () {
         var pg = null;
         pages.forEach(function (p) { if (!pg && p) pg = p; });
         if (!pg) return debugStream('sayfa/player bulunamadi');
@@ -404,6 +536,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
             return buildStreams(found, pg.url).then(function (st) { results[i] = st; });
           });
         });
+        if (pg.direct) ej.push(buildStreams(pg.direct, pg.url).then(function (st) { results[99] = st; }));
         return waitWithin(ej, AYAR.SUNUCU_SURESI + 3000).then(function () {
           var streams = [], seen = {};
           results.forEach(function (l) { (l || []).forEach(function (s) { if (!seen[s.url]) { seen[s.url] = true; streams.push(s); } }); });
