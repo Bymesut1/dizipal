@@ -338,15 +338,15 @@ function resolveEmbed(embedUrl, pageUrl, depth) {
     found.hls = uniq(found.hls); found.mp4 = uniq(found.mp4);
     dbg.push('embed ' + hostOf(embedUrl) + ' ' + (r.status || r.err) + ' ' + (r.text || '').length + 'b hls=' + found.hls.length + ' mp4=' + found.mp4.length + ' altyazi=' + found.subs.length);
     if (!found.hls.length && !found.mp4.length) {
-      var raw = String(r.text || ''), scr = [], ms, rs = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-      while ((ms = rs.exec(raw)) !== null && scr.length < 10) scr.push(ms[1].length + ':' + ms[1].slice(0, 28).replace(/\s+/g, ' '));
-      dumpLong('zF', 'metin=' + texts.length + ' scriptler ' + scr.join(' | '), 110, 4);
-      var oi = raw.search(/var\s+_[0-9a-z]{5,8}\s*=\s*function/);
-      if (oi > -1) dumpLong('zG', raw.slice(oi, oi + 700), 110, 7);
-      var si = raw.search(/setup\s*\(/);
-      if (si > -1) dumpLong('zH', raw.slice(Math.max(0, si - 120), si + 380), 110, 5);
-      var fi = raw.search(/\.m3u8|"file"|sources\s*:/i);
-      if (fi > -1) dumpLong('zI', raw.slice(Math.max(0, fi - 100), fi + 300), 110, 4);
+      // Video adresi bulunamadı: embed sayfasındaki script'leri (zS01, zS02 ...) debug satırlarına dök
+      var raw = String(r.text || ''), parts = [], ms, rs = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
+      while ((ms = rs.exec(raw)) !== null) {
+        var body = ms[1].replace(/\s+/g, ' ').trim();
+        if (body.length > 40 && !/^eval\(function\(p,a,c,k,e,d\)/.test(body)) parts.push('[' + body.length + '] ' + body);
+      }
+      unpackAll(raw).forEach(function (u) { parts.push('[ACILMIS ' + u.length + '] ' + String(u).replace(/\s+/g, ' ').trim()); });
+      var all = parts.join(' ¦ ').slice(0, 4200), zi = 0;
+      for (var zp = 0; zp < all.length; zp += 260) { zi++; dbg.push('zS' + (zi < 10 ? '0' : '') + zi + ' ' + all.slice(zp, zp + 260)); }
     }
     if (!found.hls.length && !found.mp4.length && (depth || 0) < 1) {     // iç içe iframe
       var inner = findEmbeds(r.text || '');
@@ -769,7 +769,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.9'];
+  dbg = ['dizipal v1.3.10'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
