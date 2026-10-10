@@ -508,20 +508,9 @@ function checkSub(sb, ref, allowRehost) {
     dbg.push('altyazi test ' + sb.lang + ' basliklı=' + (a.status || a.err) + '/' + at.length + 'b/' + cueCount(at) + 'replik basliksiz=' + (b.status || b.err) + '/' + bt.length + 'b/' + cueCount(bt) + 'replik ilk=' + at.slice(0, 14).replace(/\s+/g, ' '));
     if (!aOk) { subNote = 'bos/erisilemez'; return []; }             // boş / erişilemeyen altyazı listeye girmez
     if (bOk) { if (!subNote) subNote = 'acik'; return [sb]; }        // başlıksız da iniyor: olduğu gibi
-    var vtt = toVtt(at);
-    var cached = REHOST_CACHE[sb.url];
-    var rh = (allowRehost === false) ? Promise.resolve('') : (cached ? Promise.resolve(cached) : rehostVtt(vtt));
-    return rh.then(function (u) {
-      if (u) REHOST_CACHE[sb.url] = u;
-      var out = [];
-      if (u) out.push({ url: u, lang: sb.lang, label: sb.label });                         // başlıksız erişilebilir kopya
-      out.push({ url: sb.url, lang: sb.lang, label: sb.label + ' (kaynak)', withHeaders: true });   // orijinal: yalnızca oynatıcı başlık gönderebiliyorsa çalışır
-      if (!u) {
-        subNote = 'baslikli-kaynak(data+link)';
-        if (at.length < 1500000) out.push({ url: 'data:text/vtt;charset=utf-8;base64,' + b64enc(utf8Bytes(vtt)), lang: sb.lang, label: sb.label + ' (gömülü)', inline: true });
-      }
-      return out;
-    });
+    // Yalnızca "(kaynak)" altyazısı verilir (yeniden barındırılan kopya ve gömülü kopya kaldırıldı)
+    subNote = 'kaynak';
+    return [{ url: sb.url, lang: sb.lang, label: sb.label + ' (kaynak)', withHeaders: true }];
   }).catch(function () { return [sb]; });
 }
 function verifySub(s, ref) {
