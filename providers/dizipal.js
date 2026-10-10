@@ -225,10 +225,31 @@ function scanText(t, origin) {
   }
   return res;
 }
+
+// Gizlenmiş (hex/unicode kaçışlı, url-kodlu, base64) metinleri de aç
+function deepTexts(texts) {
+  var out = [], seen = {};
+  function add(t) { if (t && t.length > 8 && !seen[t]) { seen[t] = true; out.push(t); } }
+  texts.forEach(function (t) {
+    t = String(t || '');
+    if (/\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}/.test(t)) {
+      add(t.replace(/\\x([0-9a-fA-F]{2})/g, function (m, h) { return String.fromCharCode(parseInt(h, 16)); })
+            .replace(/\\u([0-9a-fA-F]{4})/g, function (m, h) { return String.fromCharCode(parseInt(h, 16)); }));
+    }
+    if (/%[0-9a-fA-F]{2}/.test(t)) { try { add(decodeURIComponent(t.replace(/%(?![0-9a-fA-F]{2})/g, '%25'))); } catch (e) {} }
+    var re = /[A-Za-z0-9+\/_\-]{28,}={0,2}/g, m, n = 0;
+    while ((m = re.exec(t)) !== null && n++ < 400) {
+      var d = b64d(m[0]);
+      if (/https?:\/\/|\.m3u8|\.mp4|"file"|sources/i.test(d) && d.length > 12) add(d);
+    }
+  });
+  return out;
+}
 function resolveEmbed(embedUrl, pageUrl, depth) {
   var origin = originOf(embedUrl);
   return fetchInfo(embedUrl, hdr(pageUrl), true).then(function (r) {
     var texts = [r.text || ''].concat(unpackAll(r.text || ''));
+    texts = texts.concat(deepTexts(texts));
     var found = { hls: [], mp4: [], subs: [], origin: origin };
     texts.forEach(function (t) {
       var s = scanText(t, origin);
@@ -237,9 +258,15 @@ function resolveEmbed(embedUrl, pageUrl, depth) {
     found.hls = uniq(found.hls); found.mp4 = uniq(found.mp4);
     dbg.push('embed ' + hostOf(embedUrl) + ' ' + (r.status || r.err) + ' ' + (r.text || '').length + 'b hls=' + found.hls.length + ' mp4=' + found.mp4.length + ' altyazi=' + found.subs.length);
     if (!found.hls.length && !found.mp4.length) {
-      var all = texts.join(' '), ki = all.search(/sources|file\s*:|\.m3u8|hls/i);
-      dbg.push('embedhtml ' + (r.text || '').length + 'b paket=' + (texts.length - 1) + ' ' + String(r.text || '').slice(0, 90).replace(/\s+/g, ' '));
-      if (ki > -1) dumpLong('zE', all.slice(Math.max(0, ki - 80), ki + 320), 100, 4);
+      var raw = String(r.text || ''), scr = [], ms, rs = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+      while ((ms = rs.exec(raw)) !== null && scr.length < 10) scr.push(ms[1].length + ':' + ms[1].slice(0, 28).replace(/\s+/g, ' '));
+      dumpLong('zF', 'metin=' + texts.length + ' scriptler ' + scr.join(' | '), 110, 4);
+      var oi = raw.search(/var\s+_[0-9a-z]{5,8}\s*=\s*function/);
+      if (oi > -1) dumpLong('zG', raw.slice(oi, oi + 700), 110, 7);
+      var si = raw.search(/setup\s*\(/);
+      if (si > -1) dumpLong('zH', raw.slice(Math.max(0, si - 120), si + 380), 110, 5);
+      var fi = raw.search(/\.m3u8|"file"|sources\s*:/i);
+      if (fi > -1) dumpLong('zI', raw.slice(Math.max(0, fi - 100), fi + 300), 110, 4);
     }
     if (!found.hls.length && !found.mp4.length && (depth || 0) < 1) {     // iç içe iframe
       var inner = findEmbeds(r.text || '');
@@ -447,7 +474,7 @@ function configTargets(c, base) {
 // ---------------- Ana akış ----------------
 function debugStream(msg) {
   if (!AYAR.DEBUG_MODU) return [];
-  return [msg].concat(dbg.slice(0, 60)).map(function (r) {
+  return [msg].concat(dbg.slice(0, 120)).map(function (r) {
     return { name: 'DEBUG ' + r, title: 'DEBUG ' + r, url: 'https://debug.invalid/', quality: 'Auto', provider: PROVIDER_ID };
   });
 }
@@ -492,7 +519,7 @@ function getStreamsInner(tmdbId, mediaType, season, episode) {
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
   season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.2.0'];
+  dbg = ['dizipal v1.3.0'];
   var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
   return Promise.all([
     getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
