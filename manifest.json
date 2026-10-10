@@ -1,0 +1,21 @@
+{
+  "name": "Dizipal Nuvio Repository",
+  "author": "",
+  "description": "Dizipal (dizipal2138.com) için Nuvio scraper: dizi ve film, HLS akışı ve yerleşik altyazı.",
+  "version": "1.0.0",
+  "scrapers": [
+    {
+      "id": "dizipal",
+      "name": "Dizipal",
+      "description": "Dizipal üzerinden Türkçe dublaj/altyazılı dizi ve film akışları (m3u8 + .vtt altyazı).",
+      "version": "1.0.0",
+      "author": "",
+      "filename": "dizipal.js",
+      "supportedTypes": ["movie", "tv"],
+      "enabled": true,
+      "formats": ["m3u8", "mp4"],
+      "contentLanguage": ["tr"],
+      "logo": ""
+    }
+  ]
+}
