@@ -1,11 +1,11 @@
 // ============================================================
-//  dizipal — Nuvio scraper (dizipal2138.com: dizi + film)
+//  dizipal — Nuvio scraper (dizipal2142.com: dizi + film)
 //  Akış: TMDB (ad) -> /arama?q= (+ adres tahmini) -> bölüm/film sayfası -> player (embed) adresi
 //        -> embed sayfası (packed JS çözülür) -> m3u8 (+ yerleşik altyazı .vtt) -> akış
 // ============================================================
 
 var AYAR = {
-  SITELER: ['https://dizipal2138.com', 'https://dizipal2139.com'],   // adres değişirse sıradakine geçer
+  SITELER: ['https://dizipal2142.com', 'https://dizipal2143.com'],   // adres değişirse sıradakine geçer
   EKLENTI_ADI: 'Dizipal',
   DEBUG_MODU: false,    // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
   MAX_ADAY: 3,          // en fazla kaç aday dizi/film sayfası denensin
