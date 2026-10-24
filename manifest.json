@@ -1,12 +1,21 @@
 {
-  "id": "dizipal",
   "name": "Dizipal",
-  "description": "Dizipal (dizi + film, Türkçe)",
+  "id": "dizipal",
   "version": "1.0.0",
+  "description": "Dizipal (dizi + film, Türkçe) Nuvio eklenti deposu",
   "author": "Bymesut1",
-  "supportedTypes": ["movie", "tv"],
-  "filename": "providers/dizipal.js",
-  "enabled": true,
-  "formats": ["m3u8", "mp4"],
-  "contentLanguage": ["tr"]
+  "scrapers": [
+    {
+      "id": "dizipal",
+      "name": "Dizipal",
+      "description": "Dizipal (dizi + film, Türkçe)",
+      "version": "1.0.0",
+      "author": "Bymesut1",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/dizipal.js",
+      "enabled": true,
+      "formats": ["m3u8", "mp4"],
+      "contentLanguage": ["tr"]
+    }
+  ]
 }
