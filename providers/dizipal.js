@@ -1,923 +1,1225 @@
-// ============================================================
-//  dizipal — Nuvio scraper (dizipal2142.com: dizi + film)
-//  Akış: TMDB (ad) -> /arama?q= (+ adres tahmini) -> bölüm/film sayfası -> player (embed) adresi
-//        -> embed sayfası (packed JS çözülür) -> m3u8 (+ yerleşik altyazı .vtt) -> akış
-// ============================================================
-
-var AYAR = {
-  SITELER: ['https://dizipal2142.com', 'https://dizipal2143.com'],   // adres değişirse sıradakine geçer
-  EKLENTI_ADI: 'Dizipal',
-  DEBUG_MODU: false,    // true: akış çıkmazsa neden çıkmadığını yazan DEBUG satırları görünür
-  MAX_ADAY: 3,          // en fazla kaç aday dizi/film sayfası denensin
-  MAX_SORGU: 3,         // en fazla kaç arama yapılsın
-  MAX_EMBED: 3,         // en fazla kaç player (embed) çözülsün
-  SES_SIRA: 0,          // 0 = her ses parçasını ayrı akış göster (Ses 1, Ses 2...). Belirli bir sıra (ör. 2) yazılırsa sadece o gösterilir
-  ALTYAZI: true,        // yerleşik altyazıları bul
-  ALTYAZI_BARINDIR: true, // altyazı sunucusu Referer/Origin istiyor ve oynatıcı bunu gönderemiyorsa: Türkçe altyazı metni geçici bir paste sitesine (paste.rs / dpaste.com / pastes.dev) yüklenip oradan verilir. İstemezsen false yap.
-  ARAMA_SURESI: 5000,   // ms
-  SUNUCU_SURESI: 5000,  // ms
-  GENEL_SURE: 20000     // ms
-};
+// Dizipal - Nuvio scraper (dizi + film)
+// CloudStream Dizipal.kt eklentisinin Nuvio karşılığı. Promise zincirleri kullanır (async/await yok).
+// Akış: TMDB id -> başlık -> site araması -> sayfa (doğrulama ekranı PoW ile geçilir)
+//       -> /ajax-player-config -> m3u8 / mp4 / iframe -> FirePlayer vb. çözümü
 
 var TMDB_KEY = '000316508321ce461cf81e7c6815eec7';
-var PROVIDER_ID = 'dizipal';
+
+// Site adresi değişirse sıradakine geçilir
+var BASES = [
+    'https://dizipal2143.com',
+    'https://dizipal2144.com',
+    'https://dizipal2145.com',
+    'https://dizipal2142.com'
+];
+
 var UA = 'Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36';
-var dbg = [];
 
-// ---------------- Yardımcılar ----------------
-function withTimeout(promise, ms) {
-  return new Promise(function (resolve, reject) {
-    var t = setTimeout(function () { reject(new Error('timeout')); }, ms);
-    promise.then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
-  });
+var DEBUG = false;
+
+var mainUrl = BASES[0];
+var jars = {}; // host -> { çerez adı: değer }
+
+function log() {
+    if (DEBUG && typeof console !== 'undefined') {
+        console.log.apply(console, ['[Dizipal]'].concat([].slice.call(arguments)));
+    }
 }
-function waitWithin(promises, ms) {
-  return new Promise(function (resolve) {
-    var left = promises.length, done = false;
-    if (!left) { resolve(); return; }
-    var t = setTimeout(function () { if (!done) { done = true; resolve(); } }, ms);
-    promises.forEach(function (p) {
-      p.then(function () {}, function () {}).then(function () {
-        left--;
-        if (left === 0 && !done) { done = true; clearTimeout(t); resolve(); }
-      });
+
+// ------------------------------------------------------------------
+// Genel yardımcılar
+// ------------------------------------------------------------------
+function hostOf(u) {
+    var m = /^https?:\/\/([^\/?#]+)/i.exec(u || '');
+    return m ? m[1].toLowerCase() : '';
+}
+
+function originOf(u) {
+    var m = /^(https?:\/\/[^\/?#]+)/i.exec(u || '');
+    return m ? m[1] : '';
+}
+
+function resolveUrl(base, ref) {
+    if (!ref) return base;
+    if (/^https?:\/\//i.test(ref)) return ref;
+    if (ref.indexOf('//') === 0) return 'https:' + ref;
+    var o = originOf(base);
+    if (ref.charAt(0) === '/') return o + ref;
+    var dir = base.replace(/[?#].*$/, '');
+    dir = dir.substring(0, dir.lastIndexOf('/') + 1);
+    return dir + ref;
+}
+
+function fixText(s) {
+    return String(s)
+        .replace(/\\u002F/gi, '/')
+        .replace(/\\u0026/gi, '&')
+        .replace(/\\\//g, '/')
+        .replace(/&amp;/g, '&');
+}
+
+function decodeEntities(s) {
+    return String(s)
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+}
+
+function seq(arr, fn) {
+    var out = [];
+    var p = Promise.resolve();
+    arr.forEach(function (x, i) {
+        p = p.then(function () {
+            return fn(x, i);
+        }).then(function (r) {
+            out.push(r);
+        });
     });
-  });
-}
-function uniq(list) { var o = []; list.forEach(function (x) { if (x && o.indexOf(x) === -1) o.push(x); }); return o; }
-function getJson(url) { return withTimeout(fetch(url), 10000).then(function (r) { return r.json(); }); }
-function hdr(ref, extra) {
-  var h = { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8' };
-  if (ref) h['Referer'] = ref;
-  if (extra) Object.keys(extra).forEach(function (k) { h[k] = extra[k]; });
-  return h;
-}
-function decodeHtml(s) {
-  return String(s || '').replace(/&quot;/g, '"').replace(/&#0?39;|&#x27;/g, "'").replace(/&nbsp;/g, ' ')
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-}
-var TRM = { 'ç': 'c', 'ğ': 'g', 'ı': 'i', 'ö': 'o', 'ş': 's', 'ü': 'u', 'â': 'a', 'î': 'i', 'û': 'u' };
-function asciiLower(s) {
-  return String(s || '').replace(/İ/g, 'i').replace(/I/g, 'i').toLowerCase().replace(/[çğıöşüâîû]/g, function (c) { return TRM[c]; });
-}
-function norm(s) { return asciiLower(s).replace(/[^a-z0-9]/g, ''); }
-function slugify(s) { return asciiLower(s).replace(/&/g, ' ').replace(/['’`]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, ''); }
-var STOP = { the: 1, a: 1, an: 1, of: 1, and: 1, ve: 1, izle: 1 };
-function toks(s) { return asciiLower(s).split(/[^a-z0-9]+/).filter(function (t) { return t && !STOP[t]; }); }
-function simScore(a, b) {
-  var na = norm(a), nb = norm(b);
-  if (!na || !nb) return 0;
-  if (na === nb) return 100;
-  if (na.length >= 4 && nb.length >= 4 && (na.indexOf(nb) > -1 || nb.indexOf(na) > -1)) {
-    return 55 + Math.round(30 * Math.min(na.length, nb.length) / Math.max(na.length, nb.length));
-  }
-  var ta = toks(a), tb = toks(b);
-  if (!ta.length || !tb.length) return 0;
-  var common = ta.filter(function (x) { return tb.indexOf(x) > -1; }).length;
-  return Math.round(60 * common / Math.max(ta.length, tb.length));
-}
-function hostOf(u) { var m = String(u || '').match(/^https?:\/\/([^\/?#]+)/i); return m ? m[1].toLowerCase() : ''; }
-function originOf(u) { var m = String(u || '').match(/^(https?:\/\/[^\/?#]+)/i); return m ? m[1] : ''; }
-function fixUrl(u) {
-  u = decodeHtml(String(u || '')).replace(/\\u002F/gi, '/').replace(/\\u0026/gi, '&').replace(/\\\//g, '/').split('#')[0];
-  return u.indexOf('//') === 0 ? 'https:' + u : u;
-}
-function relUrl(u, base) {
-  u = String(u || '').trim();
-  if (/^https?:/i.test(u)) return u;
-  if (u.indexOf('//') === 0) return 'https:' + u;
-  if (u.charAt(0) === '/') return originOf(base) + u;
-  return String(base).replace(/[?#].*$/, '').replace(/\/[^\/]*$/, '/') + u;
-}
-// base64 (atob her ortamda olmayabilir) -> UTF-8 metin
-function b64d(s) {
-  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+\/]/g, '');
-  var bytes = [], bits = 0, val = 0, i;
-  for (i = 0; i < s.length; i++) {
-    val = ((val << 6) | C.indexOf(s.charAt(i))) & 0xffffff;
-    bits += 6;
-    if (bits >= 8) { bits -= 8; bytes.push((val >> bits) & 255); }
-  }
-  try { return decodeURIComponent(bytes.map(function (b) { return '%' + ('0' + b.toString(16)).slice(-2); }).join('')); }
-  catch (e) { return bytes.map(function (b) { return String.fromCharCode(b); }).join(''); }
-}
-// Dean Edwards packer: eval(function(p,a,c,k,e,d){...}('...',62,300,'a|b'.split('|'),0,{}))
-function unpackAll(text) {
-  var out = [], re = /\}\('((?:\\.|[^'\\])*)',\s*(\d+),\s*(\d+),\s*'((?:\\.|[^'\\])*)'\.split\('\|'\)/g, m;
-  while ((m = re.exec(text)) !== null) {
-    try {
-      var p = m[1].replace(/\\'/g, "'").replace(/\\\\/g, '\\'), a = parseInt(m[2], 10), c = parseInt(m[3], 10), k = m[4].split('|');
-      var enc = function (n) { return (n < a ? '' : enc(parseInt(n / a, 10))) + ((n = n % a) > 35 ? String.fromCharCode(n + 29) : n.toString(36)); };
-      while (c--) { if (k[c]) { (function (kk) { p = p.replace(new RegExp('\\b' + enc(c) + '\\b', 'g'), function () { return kk; }); })(k[c]); } }
-      out.push(p);
-    } catch (e) {}
-  }
-  return out;
-}
-
-
-function cookieOf(res) {
-  var raw = '';
-  try { raw = String(res.headers.get('set-cookie') || ''); } catch (e) {}
-  if (!raw) return '';
-  return raw.split(/,(?=\s*[A-Za-z0-9_\-]+=)/).map(function (c) { return c.split(';')[0].trim(); }).filter(Boolean).join('; ');
-}
-// { status, url (yönlendirme sonrası), ct, text, media, cookie }
-function fetchInfo(url, headers, wantText) {
-  return withTimeout(fetch(url, { headers: headers }), AYAR.SUNUCU_SURESI).then(function (res) {
-    var ct = ''; try { ct = String(res.headers.get('content-type') || ''); } catch (e) {}
-    var fin = res.url || url;
-    var ck = cookieOf(res);
-    if (!wantText && /^(video|audio)\/|mpegurl|dash\+xml|octet-stream/i.test(ct)) return { status: res.status, url: fin, ct: ct, text: '', media: true, cookie: ck };
-    return withTimeout(res.text(), 6000).then(
-      function (t) { return { status: res.status, url: fin, ct: ct, text: t || '', media: false, cookie: ck }; },
-      function () { return { status: res.status, url: fin, ct: ct, text: '', media: false, cookie: ck }; });
-  }).catch(function (e) { return { status: 0, url: url, ct: '', text: '', media: false, err: (e && e.message) || 'hata' }; });
-}
-// Site adresi değişmiş / erişilemiyorsa sıradaki adresi dene
-function fetchSite(path) {
-  var i = 0;
-  function next() {
-    if (i >= AYAR.SITELER.length) return Promise.resolve({ status: 0, url: '', ct: '', text: '', media: false });
-    var base = AYAR.SITELER[i++];
-    return fetchInfo(base + path, hdr(base + '/'), true).then(function (r) {
-      r.base = base;
-      if (r.status === 0 || r.status >= 500 || r.status === 403) return next().then(function (r2) { return r2.status ? r2 : r; });
-      return r;
+    return p.then(function () {
+        return out;
     });
-  }
-  return next();
 }
 
-// ---------------- Arama ----------------
-function parseSearch(html) {
-  var map = {}, order = [], m;
-  html = String(html || '');
-  var re = /href=["'](?:https?:\/\/[^\/"']+)?\/(dizi|film)\/([a-z0-9\-]+)\/?["']([^>]*)>/gi;
-  while ((m = re.exec(html)) !== null) {
-    var kind = m[1], slug = m[2], path = '/' + kind + '/' + slug;
-    var end = html.indexOf('</a>', m.index);
-    var ctx = html.slice(m.index, end > -1 && end - m.index < 1500 ? end + 4 : m.index + 600);
-    var titles = [], t1 = (m[3] || '').match(/title=["']([^"']+)["']/i), t2 = ctx.match(/alt=["']([^"']{2,80})["']/i), t3 = ctx.match(/>\s*([^<>]{2,80}?)\s*<\/(?:span|h\d|div|p|a)/i);
-    [t1 && t1[1], t2 && t2[1], t3 && t3[1]].forEach(function (t) { t = decodeHtml(t || '').trim(); if (t && !/^reklam$/i.test(t)) titles.push(t); });
-    titles.push(slug.replace(/-/g, ' '));
-    var ym = html.slice(m.index, m.index + 900).match(/\b((?:19|20)\d{2})\b/);
-    if (!map[path]) { map[path] = { path: path, kind: kind, titles: [], year: 0 }; order.push(path); }
-    titles.forEach(function (t) { if (map[path].titles.indexOf(t) === -1) map[path].titles.push(t); });
-    if (ym && !map[path].year) map[path].year = parseInt(ym[1], 10);
-  }
-  return order.map(function (p) { return map[p]; });
+function sleep(ms) {
+    return new Promise(function (r) {
+        setTimeout(r, ms);
+    });
 }
 
-// ---------------- Player (embed) adresi ----------------
-function findEmbeds(html) {
-  var out = [], seen = {}, m;
-  function add(u) {
-    u = fixUrl(u);
-    if (!/^https?:/i.test(u) || seen[u]) return;
-    if (/google|youtube|facebook|twitter|blogger|googletagmanager|cloudflare|shrgo|t\.ly|bit\.ly|cutt\.ly|sivo\.|rebrand|gshort|girgara|rogagir/i.test(hostOf(u))) return;
-    if (AYAR.SITELER.some(function (s) { return hostOf(s) === hostOf(u); })) return;
-    seen[u] = true; out.push(u);
-  }
-  function scan(t) {
-    var re = /<iframe[^>]+src=["']([^"']+)["']/gi, mm;
-    while ((mm = re.exec(t)) !== null) add(mm[1]);
-    var re2 = /https?:\\?\/\\?\/[a-z0-9.\-]+\\?\/(?:embed-|embed\/|e\/|v\/)[A-Za-z0-9_\-]+(?:\.html)?/gi;
-    while ((mm = re2.exec(t)) !== null) add(mm[0]);
-  }
-  html = String(html || '');
-  scan(html);
-  if (!out.length) {                                     // sayfada saklanan base64 / JSON bloklarına bak
-    var re3 = /(?:aHR0c|eyJ)[A-Za-z0-9+\/=_\-]{20,}/g, n = 0;
-    while ((m = re3.exec(html)) !== null && n++ < 40) scan(b64d(m[0]));
-  }
-  return out;
+// ------------------------------------------------------------------
+// HTTP + çerez deposu (RN fetch'inde Set-Cookie tek satır olarak gelir)
+// ------------------------------------------------------------------
+function cookieHeader(host) {
+    var j = jars[host];
+    if (!j) return '';
+    var a = [];
+    for (var k in j) a.push(k + '=' + j[k]);
+    return a.join('; ');
 }
 
-// ---------------- Embed çözme ----------------
-var LANGN = { tur: 'Türkçe', eng: 'İngilizce', en: 'İngilizce', tr: 'Türkçe', ger: 'Almanca', fre: 'Fransızca', spa: 'İspanyolca', ara: 'Arapça', rus: 'Rusça' };
-function subLang(label, url) {
-  var l = asciiLower(label || '');
-  if (/turk|^tr$|\btur\b/.test(l)) return 'tur';
-  if (/engl|ingiliz|^en$|\beng\b/.test(l)) return 'eng';
-  var m = String(url).match(/_([a-z]{2,3})\.(?:vtt|srt)/i);
-  return m ? m[1].toLowerCase() : 'und';
-}
-function mkSub(url, label) {
-  var lang = subLang(label, url);
-  return { url: url, lang: lang, label: LANGN[lang] || label || lang };
-}
-function scanText(t, origin) {
-  t = fixUrl(t);
-  var res = { hls: [], mp4: [], subs: [] }, seen = {}, m;
-  function push(arr, u) { if (!seen[u]) { seen[u] = true; arr.push(u); } }
-  var re = /https?:\/\/[^\s"'<>\\)]+?\.m3u8(?:\?[^\s"'<>\\)]*)?/gi;
-  while ((m = re.exec(t)) !== null) push(res.hls, m[0]);
-  var reRel = /["'](\/[^"'\s]+?\.m3u8[^"'\s]*)["']/gi;
-  while ((m = reRel.exec(t)) !== null) push(res.hls, origin + m[1]);
-  // uzantısız HLS adresi (imagestoo vb.): https://host/m3/<şifreli-token>  (bu adres Referer olmadan "security error" verir)
-  var reM3 = /https?:\/\/[^\s"'<>\\)]+?\/m3\/[A-Za-z0-9+\/=_%\-.]{24,}/gi;
-  while ((m = reM3.exec(t)) !== null) push(res.hls, m[0]);
-  var reM3r = /["'`](\/m3\/[A-Za-z0-9+\/=_%\-.]{24,})["'`]/gi;
-  while ((m = reM3r.exec(t)) !== null) push(res.hls, origin + m[1]);
-  var re2 = /https?:\/\/[^\s"'<>\\)]+?\.mp4(?:\?[^\s"'<>\\)]*)?/gi;
-  while ((m = re2.exec(t)) !== null) push(res.mp4, m[0]);
-  var re3 = /https?:\/\/[^\s"'<>\\)]+?\.(?:vtt|srt)(?:\?[^\s"'<>\\)]*)?/gi;
-  while ((m = re3.exec(t)) !== null) {
-    // etiket / tür YALNIZCA bu adresin bulunduğu { ... } nesnesinden okunur (komşu altyazının etiketi karışmasın)
-    var oS = t.lastIndexOf('{', m.index), oE = t.indexOf('}', m.index), obj = '';
-    if (oS > -1 && oE > -1 && oE - oS < 700) obj = t.slice(oS, oE + 1);
-    if (/["']?kind["']?\s*:\s*["'](?:thumbnails|chapters|metadata)/i.test(obj)) continue;       // önizleme / bölüm dosyası altyazı değil
-    var lb = obj ? obj.match(/["']?label["']?\s*:\s*["']([^"']+)["']/i) : null;
-    if (!lb && !obj) {
-      var ctx = t.slice(Math.max(0, m.index - 120), m.index + m[0].length + 120);
-      lb = ctx.match(/label\s*["']?\s*:\s*["']([^"']+)["']/i);
-    }
-    if (!seen[m[0]]) { seen[m[0]] = true; res.subs.push(mkSub(m[0], lb && lb[1])); }
-  }
-  // JW Player / Video.js ayarı: tracks:[{file:"...", label:"Turkish", kind:"captions"}] (adres .vtt ile bitmeyebilir, göreli olabilir)
-  var reO = /\{[^{}]{8,700}\}/g, mo;
-  while ((mo = reO.exec(t)) !== null) {
-    var ob = mo[0];
-    var fm = ob.match(/[\"']?(?:file|src|url)[\"']?\s*:\s*[\"']([^\"']+)[\"']/i);
-    var km = ob.match(/[\"']?kind[\"']?\s*:\s*[\"']([^\"']+)[\"']/i);
-    var lm = ob.match(/[\"']?(?:label|srclang|language|lang)[\"']?\s*:\s*[\"']([^\"']+)[\"']/i);
-    if (!fm) continue;
-    var kind = km ? km[1].toLowerCase() : '', fu = fm[1].replace(/\\\//g, '/');
-    if (/thumb|chapter|metadata/.test(kind)) continue;
-    if (/\.(?:m3u8|mp4|mkv|jpe?g|png|gif|webp|js|css|ts)(?:\?|$)/i.test(fu)) continue;
-    var capLike = /caption|subtitle/.test(kind) || (lm && /turk|^tr$|^tur$|engl|ingiliz|^en$|^eng$|altyaz/i.test(lm[1]) && /vtt|srt|sub|caption|tr|tur/i.test(fu));
-    if (!capLike) continue;
-    var abs = /^https?:/i.test(fu) ? fu : (fu.indexOf('//') === 0 ? 'https:' + fu : (fu.charAt(0) === '/' ? origin + fu : ''));
-    if (abs && !seen[abs]) { seen[abs] = true; res.subs.push(mkSub(abs, lm && lm[1])); }
-  }
-  return res;
+function storeCookies(host, sc) {
+    if (!sc) return;
+    var j = jars[host] || (jars[host] = {});
+    String(sc).split(/,(?=\s*[^;,=\s]+=)/).forEach(function (c) {
+        var m = /^\s*([^=;\s]+)=([^;]*)/.exec(c);
+        if (m) j[m[1]] = m[2];
+    });
 }
 
-// Gizlenmiş (hex/unicode kaçışlı, url-kodlu, base64) metinleri de aç
-function deepTexts(texts) {
-  var out = [], seen = {};
-  function add(t) { if (t && t.length > 8 && !seen[t]) { seen[t] = true; out.push(t); } }
-  texts.forEach(function (t) {
-    t = String(t || '');
-    if (/\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}/.test(t)) {
-      add(t.replace(/\\x([0-9a-fA-F]{2})/g, function (m, h) { return String.fromCharCode(parseInt(h, 16)); })
-            .replace(/\\u([0-9a-fA-F]{4})/g, function (m, h) { return String.fromCharCode(parseInt(h, 16)); }));
-    }
-    if (/%[0-9a-fA-F]{2}/.test(t)) { try { add(decodeURIComponent(t.replace(/%(?![0-9a-fA-F]{2})/g, '%25'))); } catch (e) {} }
-    var re = /[A-Za-z0-9+\/_\-]{28,}={0,2}/g, m, n = 0;
-    while ((m = re.exec(t)) !== null && n++ < 400) {
-      var d = b64d(m[0]);
-      if (/https?:\/\/|\.m3u8|\.mp4|"file"|sources/i.test(d) && d.length > 12) add(d);
-    }
-  });
-  return out;
+function http(method, url, opt) {
+    opt = opt || {};
+    var h = {};
+    var src = opt.headers || {};
+    for (var k in src) h[k] = src[k];
+    if (!h['User-Agent']) h['User-Agent'] = UA;
+    var host = hostOf(url);
+    var ck = cookieHeader(host);
+    if (ck && !h['Cookie']) h['Cookie'] = ck;
+    var init = { method: method, headers: h };
+    if (opt.body != null) init.body = opt.body;
+    return new Promise(function (resolve) {
+        var done = false;
+        var t = setTimeout(function () {
+            if (!done) {
+                done = true;
+                resolve(null);
+            }
+        }, opt.timeout || 15000);
+        var fin = function (v) {
+            if (!done) {
+                done = true;
+                clearTimeout(t);
+                resolve(v);
+            }
+        };
+        try {
+            fetch(url, init).then(function (res) {
+                var sc = null;
+                try {
+                    sc = res.headers.get('set-cookie');
+                } catch (e) {}
+                return res.text().then(function (text) {
+                    storeCookies(host, sc);
+                    fin({ status: res.status, text: text, url: url });
+                });
+            }).catch(function () {
+                fin(null);
+            });
+        } catch (e) {
+            fin(null);
+        }
+    });
 }
 
-// ---- XOR + base64 şifreli player adresi ----
-// Embed sayfası: var _x=function(e){var k="ANAHTAR",r="",d=atob(e);for(...)r+=String.fromCharCode(d.charCodeAt(i)^k.charCodeAt(i%k.length));return r;}
-//                jwplayer("vplayer").setup({sources:[{file:_x("BASE64...")}] ...
+function getText(url, headers) {
+    return http('GET', url, { headers: headers || {} }).then(function (r) {
+        return r ? r.text : '';
+    });
+}
+
+// ------------------------------------------------------------------
+// Base64 / UTF-8 / SHA-256 / AES-CBC (modül yok, saf JS)
+// ------------------------------------------------------------------
+var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
 function b64bin(s) {
-  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+\/]/g, '');
-  var bytes = [], bits = 0, val = 0, i;
-  for (i = 0; i < s.length; i++) {
-    val = ((val << 6) | C.indexOf(s.charAt(i))) & 0xffffff;
-    bits += 6;
-    if (bits >= 8) { bits -= 8; bytes.push((val >> bits) & 255); }
-  }
-  return bytes;
+    var c = String(s).replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+\/]/g, '');
+    var out = [];
+    var buf = 0;
+    var bits = 0;
+    for (var i = 0; i < c.length; i++) {
+        buf = (buf << 6) | B64.indexOf(c.charAt(i));
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push((buf >> bits) & 255);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    return out;
 }
-function xorDecode(b64, key) {
-  var b = b64bin(b64), r = '', i;
-  for (i = 0; i < b.length; i++) r += String.fromCharCode(b[i] ^ key.charCodeAt(i % key.length));
-  return r;
+
+function latin1(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i] & 255);
+    return s;
 }
-function xorTexts(t) {
-  t = String(t || '');
-  var out = [], keys = [], names = {}, m;
-  var reF = /(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*function\s*\(\s*\w+\s*\)\s*\{\s*var\s+\w+\s*=\s*(["'])([^"']{3,64})\2/g;
-  while ((m = reF.exec(t)) !== null) { names[m[1]] = m[3]; keys.push(m[3]); }
-  var reD = /function\s+([A-Za-z_$][\w$]*)\s*\(\s*\w+\s*\)\s*\{\s*var\s+\w+\s*=\s*(["'])([^"']{3,64})\2/g;
-  while ((m = reD.exec(t)) !== null) { names[m[1]] = m[3]; keys.push(m[3]); }
-  var reK = /(?:var|let|const)\s+\w+\s*=\s*(["'])([A-Za-z0-9]{6,24})\1/g;
-  while ((m = reK.exec(t)) !== null) keys.push(m[2]);
-  keys = uniq(keys);
-  var reC = /([A-Za-z_$][\w$]*)\s*\(\s*(["'])([A-Za-z0-9+\/=_-]{24,})\2\s*\)/g;
-  while ((m = reC.exec(t)) !== null) {
-    var fn = m[1], data = m[3];
-    var tryKeys = names[fn] ? [names[fn]] : keys.slice(0, 8);
-    tryKeys.forEach(function (k) {
-      var d = xorDecode(data, k);
-      if (/^\s*https?:\/\/[\x21-\x7e]+/.test(d) || /https?:\/\/|\.m3u8|\.mp4|\.vtt|"file"|sources/i.test(d)) out.push(d);
+
+function utf8Decode(bytes) {
+    var s = '';
+    var i = 0;
+    while (i < bytes.length) {
+        var b = bytes[i++];
+        if (b < 128) {
+            s += String.fromCharCode(b);
+        } else if (b >= 192 && b < 224) {
+            s += String.fromCharCode(((b & 31) << 6) | (bytes[i++] & 63));
+        } else if (b >= 224 && b < 240) {
+            s += String.fromCharCode(((b & 15) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63));
+        } else {
+            var cp = ((b & 7) << 18) | ((bytes[i++] & 63) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63);
+            cp -= 0x10000;
+            s += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 1023));
+        }
+    }
+    return s;
+}
+
+function utf8Encode(str) {
+    var out = [];
+    for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c < 128) {
+            out.push(c);
+        } else if (c < 2048) {
+            out.push(192 | (c >> 6), 128 | (c & 63));
+        } else if (c >= 0xD800 && c < 0xDC00 && i + 1 < str.length) {
+            var cp = 0x10000 + ((c - 0xD800) << 10) + (str.charCodeAt(++i) - 0xDC00);
+            out.push(240 | (cp >> 18), 128 | ((cp >> 12) & 63), 128 | ((cp >> 6) & 63), 128 | (cp & 63));
+        } else {
+            out.push(224 | (c >> 12), 128 | ((c >> 6) & 63), 128 | (c & 63));
+        }
+    }
+    return out;
+}
+
+var K256 = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
+
+function sha256Hex(str) {
+    var bytes = utf8Encode(str);
+    var l = bytes.length;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    var hi = Math.floor((l * 8) / 4294967296);
+    var lo = (l * 8) >>> 0;
+    bytes.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255,
+        (lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255);
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var w = new Array(64);
+    for (var off = 0; off < bytes.length; off += 64) {
+        var i;
+        for (i = 0; i < 16; i++) {
+            w[i] = ((bytes[off + 4 * i] << 24) | (bytes[off + 4 * i + 1] << 16) | (bytes[off + 4 * i + 2] << 8) | bytes[off + 4 * i + 3]) | 0;
+        }
+        for (i = 16; i < 64; i++) {
+            var a15 = w[i - 15];
+            var a2 = w[i - 2];
+            var s0 = ((a15 >>> 7) | (a15 << 25)) ^ ((a15 >>> 18) | (a15 << 14)) ^ (a15 >>> 3);
+            var s1 = ((a2 >>> 17) | (a2 << 15)) ^ ((a2 >>> 19) | (a2 << 13)) ^ (a2 >>> 10);
+            w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+        }
+        var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+        for (i = 0; i < 64; i++) {
+            var S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+            var ch = (e & f) ^ (~e & g);
+            var t1 = (h + S1 + ch + K256[i] + w[i]) | 0;
+            var S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+            var mj = (a & b) ^ (a & c) ^ (b & c);
+            var t2 = (S0 + mj) | 0;
+            h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+        }
+        H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+        H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+    var hex = '';
+    for (var k = 0; k < 8; k++) hex += ('00000000' + (H[k] >>> 0).toString(16)).slice(-8);
+    return hex;
+}
+
+var SBOX = new Array(256);
+var INV_SBOX = new Array(256);
+(function () {
+    function rotl8(x, s) {
+        return ((x << s) | (x >> (8 - s))) & 255;
+    }
+    var p = 1;
+    var q = 1;
+    do {
+        p = (p ^ (p << 1) ^ ((p & 0x80) ? 0x1B : 0)) & 255;
+        q = (q ^ (q << 1)) & 255;
+        q = (q ^ (q << 2)) & 255;
+        q = (q ^ (q << 4)) & 255;
+        if (q & 0x80) q ^= 0x09;
+        var x = q ^ rotl8(q, 1) ^ rotl8(q, 2) ^ rotl8(q, 3) ^ rotl8(q, 4);
+        SBOX[p] = (x ^ 0x63) & 255;
+    } while (p !== 1);
+    SBOX[0] = 0x63;
+    for (var i = 0; i < 256; i++) INV_SBOX[SBOX[i]] = i;
+})();
+
+function gmul(a, b) {
+    var p = 0;
+    for (var i = 0; i < 8; i++) {
+        if (b & 1) p ^= a;
+        var hi = a & 0x80;
+        a = (a << 1) & 255;
+        if (hi) a ^= 0x1B;
+        b >>= 1;
+    }
+    return p;
+}
+
+function aesExpand(key) {
+    var Nk = key.length / 4;
+    var Nr = Nk + 6;
+    var w = [];
+    var i;
+    for (i = 0; i < Nk; i++) w[i] = [key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]];
+    var rcon = 1;
+    for (i = Nk; i < 4 * (Nr + 1); i++) {
+        var t = w[i - 1].slice();
+        if (i % Nk === 0) {
+            t = [SBOX[t[1]] ^ rcon, SBOX[t[2]], SBOX[t[3]], SBOX[t[0]]];
+            rcon = ((rcon << 1) ^ ((rcon & 0x80) ? 0x1B : 0)) & 255;
+        } else if (Nk > 6 && i % Nk === 4) {
+            t = [SBOX[t[0]], SBOX[t[1]], SBOX[t[2]], SBOX[t[3]]];
+        }
+        w[i] = [w[i - Nk][0] ^ t[0], w[i - Nk][1] ^ t[1], w[i - Nk][2] ^ t[2], w[i - Nk][3] ^ t[3]];
+    }
+    return { w: w, Nr: Nr };
+}
+
+function aesDecBlock(ks, blk) {
+    var s = blk.slice();
+    var w = ks.w;
+    var r;
+    var c;
+    var i;
+    function addKey(round) {
+        for (c = 0; c < 4; c++) for (r = 0; r < 4; r++) s[4 * c + r] ^= w[4 * round + c][r];
+    }
+    function invShift() {
+        var t = s.slice();
+        for (c = 0; c < 4; c++) for (r = 0; r < 4; r++) s[4 * ((c + r) % 4) + r] = t[4 * c + r];
+    }
+    function invSub() {
+        for (i = 0; i < 16; i++) s[i] = INV_SBOX[s[i]];
+    }
+    function invMix() {
+        for (c = 0; c < 4; c++) {
+            var a0 = s[4 * c], a1 = s[4 * c + 1], a2 = s[4 * c + 2], a3 = s[4 * c + 3];
+            s[4 * c] = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
+            s[4 * c + 1] = gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13);
+            s[4 * c + 2] = gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11);
+            s[4 * c + 3] = gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14);
+        }
+    }
+    addKey(ks.Nr);
+    for (var round = ks.Nr - 1; round >= 1; round--) {
+        invShift();
+        invSub();
+        addKey(round);
+        invMix();
+    }
+    invShift();
+    invSub();
+    addKey(0);
+    return s;
+}
+
+// AES-CBC + PKCS7; geçersizse null
+function aesCbcDecrypt(key, iv, ct) {
+    if ((key.length !== 16 && key.length !== 24 && key.length !== 32) || iv.length !== 16) return null;
+    if (ct.length === 0 || ct.length % 16 !== 0) return null;
+    var ks = aesExpand(key);
+    var out = [];
+    var prev = iv;
+    for (var off = 0; off < ct.length; off += 16) {
+        var blk = ct.slice(off, off + 16);
+        var d = aesDecBlock(ks, blk);
+        for (var i = 0; i < 16; i++) out.push(d[i] ^ prev[i]);
+        prev = blk;
+    }
+    var pad = out[out.length - 1];
+    if (pad < 1 || pad > 16) return null;
+    for (var j = out.length - pad; j < out.length; j++) if (out[j] !== pad) return null;
+    return out.slice(0, out.length - pad);
+}
+
+function decryptEnc(enc) {
+    try {
+        var k1 = b64bin(enc.k1);
+        var k2 = b64bin(enc.k2);
+        var iv = b64bin(enc.iv);
+        var ct = b64bin(enc.c);
+        var n = Math.min(k1.length, k2.length);
+        var key = [];
+        for (var i = 0; i < n; i++) key.push((k1[i] ^ k2[i]) & 255);
+        var r = aesCbcDecrypt(key, iv, ct);
+        if (!r && n > 32) r = aesCbcDecrypt(key.slice(0, 32), iv, ct);
+        return r ? utf8Decode(r) : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// ------------------------------------------------------------------
+// Sayfa ayrıştırma (cheerio yok, regex)
+// ------------------------------------------------------------------
+function titleOf(t) {
+    var m = /<title[^>]*>([^<]*)<\/title>/i.exec(t || '');
+    return m ? m[1].trim() : '';
+}
+
+function parseMetas(html) {
+    var out = {};
+    var re = /<meta\b[^>]*>/gi;
+    var m;
+    while ((m = re.exec(html))) {
+        var tag = m[0];
+        var n = /\bname\s*=\s*["']([^"']+)["']/i.exec(tag);
+        var c = /\bcontent\s*=\s*["']([^"']*)["']/i.exec(tag);
+        if (n) out[n[1]] = c ? decodeEntities(c[1]) : '';
+    }
+    return out;
+}
+
+// "Erişim doğrulanıyor" / "Doğrulama" ara sayfası mı?
+function isChallenge(t) {
+    t = t || '';
+    var title = titleOf(t);
+    if (/doğrulama/i.test(title) || /dogrulama/i.test(title)) return true;
+    var phrase = /Erişim doğrulanıyor/i.test(t) || /Erisim dogrulaniyor/i.test(t);
+    if (!phrase) return false;
+    var real = t.indexOf('content-card') >= 0 || t.indexOf('data-cfg') >= 0 ||
+        t.indexOf('trending-item') >= 0 || t.indexOf('episode-list-item') >= 0;
+    return !real;
+}
+
+// ------------------------------------------------------------------
+// Doğrulama ekranı: meta _bc/_bn/_bk/_br, sha256 PoW, /_bc_verify
+// ------------------------------------------------------------------
+function passChallenge(base, text, pageUrl) {
+    var srcs = [];
+    var re = /<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi;
+    var m;
+    while ((m = re.exec(text))) {
+        var u = resolveUrl(pageUrl, decodeEntities(m[1]));
+        if (hostOf(u) === hostOf(base)) srcs.push(u);
+    }
+    srcs = srcs.slice(0, 2);
+    return seq(srcs, function (u) {
+        return getText(u, {
+            Referer: pageUrl,
+            Accept: '*/*',
+            'Sec-Fetch-Dest': 'script',
+            'Sec-Fetch-Mode': 'no-cors',
+            'Sec-Fetch-Site': 'same-origin'
+        });
+    }).then(function (texts) {
+        var scriptText = texts.join('\n');
+        var dec = '';
+        var km = /var k=["']([0-9A-Za-z]{8,64})["'],p=["']([A-Za-z0-9+\/=_-]{40,})["']/.exec(scriptText);
+        if (km) {
+            var key = km[1];
+            var bytes = b64bin(km[2]);
+            for (var i = 0; i < bytes.length; i++) {
+                dec += String.fromCharCode((bytes[i] & 255) ^ key.charCodeAt(i % key.length));
+            }
+        }
+        var nBc = '_bc', nBn = '_bn', nBk = '_bk', nBr = '_br';
+        var nm = /B=meta\("([^"]+)"\),N=meta\("([^"]+)"\),Z=parseInt\(meta\("([^"]+)"\)/.exec(dec);
+        if (nm) {
+            nBc = nm[1];
+            nBn = nm[2];
+            nBk = nm[3];
+        }
+        var rm = /R=meta\("([^"]+)"\)/.exec(dec);
+        if (rm) nBr = rm[1];
+        var epm = /fetch\(["'](\/[^"']+)["']/.exec(dec);
+        var endpoint = epm ? epm[1] : '/_bc_verify';
+        var sm = /sha256Hex\(nonce\+["'](.)["']\+guess\)/.exec(dec);
+        var sep = sm ? sm[1] : ':';
+
+        var metas = parseMetas(text);
+        var bc = metas[nBc] || '';
+        var bn = metas[nBn] || '';
+        var zeros = parseInt(metas[nBk], 10);
+        if (isNaN(zeros)) zeros = 4;
+        var ret = metas[nBr] || '/';
+        if (!bc || !bn) {
+            log('doğrulama metası eksik', nBc, nBn);
+            return null;
+        }
+
+        var t0 = Date.now();
+        return sleep(500).then(function () {
+            var pre = '';
+            for (var z = 0; z < zeros; z++) pre += '0';
+            var ans = null;
+            for (var i = 0; i <= 8000000; i++) {
+                if (sha256Hex(bn + sep + i).indexOf(pre) === 0) {
+                    ans = String(i);
+                    break;
+                }
+            }
+            if (ans === null) return null;
+            var o = {
+                b: bc, a: ans, t: (Date.now() - t0) + 150, m: 9, tc: 6, sc: 1,
+                c: '7f3a9c2e5b1d4068',
+                w: 'Qualcomm|Adreno (TM) 619|WebGL 1.0 (OpenGL ES 2.0 Chromium)',
+                au: '124.04347', pl: 0, hw: 8, dp: 2.75, sw: '393x873', tz: -180,
+                tn: 'Europe/Istanbul', lg: 'tr-TR', wd: 0, ck: 1, pm: 'prompt', vs: 'visible', r: ret
+            };
+            return http('POST', base + endpoint, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    Origin: base,
+                    Referer: pageUrl,
+                    Accept: '*/*'
+                },
+                body: JSON.stringify(o)
+            }).then(function (r) {
+                log('verify', r ? r.status : 'yok', r ? r.text.slice(0, 120) : '');
+            });
+        });
     });
-  }
-  return uniq(out);
+}
+
+// tries: doğrulama ekranı çıkarsa kaç kez çözülsün
+function fetchSite(path, tries) {
+    var order = [mainUrl].concat(BASES.filter(function (b) {
+        return b !== mainUrl;
+    }));
+    function tryBase(i) {
+        if (i >= order.length) return Promise.resolve(null);
+        var b = order[i];
+        var get = function () {
+            return http('GET', b + path, {
+                headers: {
+                    Referer: b + '/',
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8'
+                }
+            });
+        };
+        var solve = function (r, n) {
+            if (!r || !isChallenge(r.text) || n >= tries) return Promise.resolve(r);
+            return passChallenge(b, r.text, b + path).then(get).then(function (r2) {
+                return solve(r2, n + 1);
+            });
+        };
+        return get().then(function (r) {
+            if (!r) return tryBase(i + 1);
+            return solve(r, 0).then(function (r2) {
+                if (r2 && r2.status === 200 && r2.text && !isChallenge(r2.text)) {
+                    mainUrl = b;
+                    return { base: b, text: r2.text };
+                }
+                if (r2 && r2.status === 200) return null; // site ayakta ama doğrulama geçilemedi
+                return tryBase(i + 1);
+            });
+        });
+    }
+    return tryBase(0);
+}
+
+// ------------------------------------------------------------------
+// Oyuncu ayarı: /ajax-player-config (data-cfg, AES-CBC, anahtar = k1 XOR k2)
+// ------------------------------------------------------------------
+function parseCfg(text) {
+    if (!text) return null;
+    var o;
+    try {
+        o = JSON.parse(text);
+    } catch (e) {
+        return null;
+    }
+    if (!o || typeof o !== 'object') return null;
+    var c = o.config;
+    var t = c ? (c.t || '') : (o.t || '');
+    var v = c ? (c.v || '') : '';
+    if (t === 'null') t = '';
+    if (v === 'null') v = '';
+    if (o.enc) {
+        var d = decryptEnc(o.enc);
+        if (d) v = d;
+    }
+    if (!v) return null;
+    return { t: String(t), v: String(v), raw: text };
+}
+
+function formBody(o) {
+    var a = [];
+    for (var k in o) a.push(encodeURIComponent(k) + '=' + encodeURIComponent(o[k]));
+    return a.join('&');
+}
+
+function playerConfig(site, pageUrl) {
+    var tags = [];
+    var re = /<[^>]*\bdata-cfg\s*=\s*["']([^"']*)["'][^>]*>/gi;
+    var m;
+    while ((m = re.exec(site.text))) tags.push({ tag: m[0], cfg: decodeEntities(m[1]) });
+    if (!tags.length) return Promise.resolve(null);
+    var pick = tags.filter(function (x) {
+        return /videoContainer/.test(x.tag);
+    })[0] || tags[0];
+    var cfg = pick.cfg;
+    if (!cfg) return Promise.resolve(null);
+    var metas = parseMetas(site.text);
+    var csrf = metas['csrf-token'] || '';
+    var url = site.base + '/ajax-player-config';
+    var hA = {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        Origin: site.base,
+        Referer: pageUrl,
+        Accept: 'application/json, text/javascript, */*; q=0.01'
+    };
+    // A: tarayıcıdaki gibi
+    return http('POST', url, { headers: hA, body: formBody({ cfg: cfg }) }).then(function (ra) {
+        var r = ra ? parseCfg(ra.text) : null;
+        if (r) return r;
+        // B: ajax-token + csrf
+        return http('GET', site.base + '/ajax-token', {
+            headers: { Referer: pageUrl, 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' }
+        }).then(function (tr) {
+            var tok = '';
+            try {
+                tok = JSON.parse(tr ? tr.text : '').t || '';
+            } catch (e) {}
+            if (tok && tok !== 'null') {
+                var j = jars[hostOf(site.base)] || (jars[hostOf(site.base)] = {});
+                j._ct = tok;
+            }
+            var hB = {};
+            for (var k in hA) hB[k] = hA[k];
+            var xt = csrf || tok;
+            if (xt && xt !== 'null') hB['X-CSRF-Token'] = xt;
+            var body = { cfg: cfg };
+            if (tok && tok !== 'null') {
+                body.token = tok;
+                body.csrf_token = tok;
+            } else if (csrf) body.csrf_token = csrf;
+            return http('POST', url, { headers: hB, body: formBody(body) }).then(function (rb) {
+                var r2 = rb ? parseCfg(rb.text) : null;
+                if (r2) return r2;
+                // C: sade istek
+                return http('POST', url, {
+                    headers: { Referer: pageUrl, 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: formBody({ cfg: cfg })
+                }).then(function (rc) {
+                    return rc ? parseCfg(rc.text) : null;
+                });
+            });
+        });
+    });
+}
+
+// ------------------------------------------------------------------
+// Embed çözme: packer, XOR, base64, FirePlayer
+// ------------------------------------------------------------------
+function unpackAll(text) {
+    var out = [];
+    var re = /\}\('((?:\\.|[^'\\])*)',\s*(\d+),\s*(\d+),\s*'((?:\\.|[^'\\])*)'\.split\('\|'\)/g;
+    var m;
+    while ((m = re.exec(text))) {
+        try {
+            var p = m[1].replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+            var a = parseInt(m[2], 10);
+            var c = parseInt(m[3], 10);
+            var k = m[4].split('|');
+            var enc = function (n) {
+                var hi = n < a ? '' : enc(Math.floor(n / a));
+                var r = n % a;
+                return hi + (r > 35 ? String.fromCharCode(r + 29) : r.toString(36));
+            };
+            while (c-- > 0) {
+                if (c < k.length && k[c]) {
+                    var word = k[c];
+                    var e = enc(c).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    p = p.replace(new RegExp('\\b' + e + '\\b', 'g'), function () {
+                        return word;
+                    });
+                }
+            }
+            out.push(p);
+        } catch (e) {}
+    }
+    return out;
+}
+
+function deepTexts(texts) {
+    var out = [];
+    var seen = {};
+    function add(s) {
+        if (!seen[s]) {
+            seen[s] = 1;
+            out.push(s);
+        }
+    }
+    texts.forEach(function (t) {
+        if (/\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}/.test(t)) {
+            var d = t.replace(/\\x([0-9a-fA-F]{2})/g, function (_, h) {
+                return String.fromCharCode(parseInt(h, 16));
+            });
+            d = d.replace(/\\u([0-9a-fA-F]{4})/g, function (_, h) {
+                return String.fromCharCode(parseInt(h, 16));
+            });
+            add(d);
+        }
+        if (/%[0-9a-fA-F]{2}/.test(t)) {
+            try {
+                add(decodeURIComponent(t.replace(/%(?![0-9a-fA-F]{2})/g, '%25')));
+            } catch (e) {}
+        }
+        var re = /[A-Za-z0-9+\/_\-]{28,}={0,2}/g;
+        var m;
+        var n = 0;
+        while ((m = re.exec(t)) && n++ < 400) {
+            var bytes = b64bin(m[0]);
+            if (bytes.length) {
+                var d2 = latin1(bytes);
+                if (d2.length > 12 && /https?:\/\/|\.m3u8|\.mp4|"file"|sources/i.test(d2)) add(d2);
+            }
+        }
+    });
+    return out;
+}
+
+function xorDecode(b64, key) {
+    var b = b64bin(b64);
+    var s = '';
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode((b[i] & 255) ^ key.charCodeAt(i % key.length));
+    return s;
+}
+
+function xorTexts(t) {
+    var out = [];
+    var seen = {};
+    var names = {};
+    var keys = [];
+    function addKey(k) {
+        if (keys.indexOf(k) < 0) keys.push(k);
+    }
+    var m;
+    var r1 = /(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*function\s*\(\s*\w+\s*\)\s*\{\s*var\s+\w+\s*=\s*(["'])([^"']{3,64})\2/g;
+    while ((m = r1.exec(t))) {
+        names[m[1]] = m[3];
+        addKey(m[3]);
+    }
+    var r2 = /function\s+([A-Za-z_$][\w$]*)\s*\(\s*\w+\s*\)\s*\{\s*var\s+\w+\s*=\s*(["'])([^"']{3,64})\2/g;
+    while ((m = r2.exec(t))) {
+        names[m[1]] = m[3];
+        addKey(m[3]);
+    }
+    var r3 = /(?:var|let|const)\s+\w+\s*=\s*(["'])([A-Za-z0-9]{6,24})\1/g;
+    while ((m = r3.exec(t))) addKey(m[2]);
+    var r4 = /([A-Za-z_$][\w$]*)\s*\(\s*(["'])([A-Za-z0-9+\/=_-]{24,})\2\s*\)/g;
+    while ((m = r4.exec(t))) {
+        var fn = m[1];
+        var data = m[3];
+        var tryKeys = names[fn] ? [names[fn]] : keys.slice(0, 8);
+        for (var i = 0; i < tryKeys.length; i++) {
+            var d = xorDecode(data, tryKeys[i]);
+            if (/https?:\/\/|\.m3u8|\.mp4|\.vtt|"file"|sources/i.test(d) && !seen[d]) {
+                seen[d] = 1;
+                out.push(d);
+            }
+        }
+    }
+    return out;
+}
+
+function newFound(origin) {
+    return { origin: origin, hls: [], mp4: [], cookies: {} };
+}
+
+function addUniq(arr, v) {
+    if (arr.indexOf(v) < 0) arr.push(v);
+}
+
+// Metin içinden m3u8 / mp4 adreslerini topla
+function scan(raw, origin, f) {
+    var t = fixText(raw);
+    var m;
+    var r = /https?:\/\/[^\s"'<>\\)]+?\.m3u8(?:\?[^\s"'<>\\)]*)?/gi;
+    while ((m = r.exec(t))) addUniq(f.hls, m[0]);
+    r = /["'](\/[^"'\s]+?\.m3u8[^"'\s]*)["']/gi;
+    while ((m = r.exec(t))) addUniq(f.hls, origin + m[1]);
+    // uzantısız HLS: https://host/m3/<şifreli-token>
+    r = /https?:\/\/[^\s"'<>\\)]+?\/m3\/[A-Za-z0-9+\/=_%\-.]{24,}/g;
+    while ((m = r.exec(t))) addUniq(f.hls, m[0]);
+    // Fire HLS Player: .../cdn/hls/<kod>/master.txt
+    r = /https?:\/\/[^\s"'<>\\)]+?\/master\.txt(?:\?[^\s"'<>\\)]*)?/gi;
+    while ((m = r.exec(t))) addUniq(f.hls, m[0]);
+    r = /["'](\/[^"'\s]+?\/master\.txt[^"'\s]*)["']/gi;
+    while ((m = r.exec(t))) addUniq(f.hls, origin + m[1]);
+    r = /https?:\/\/[^\s"'<>\\)]+?\.mp4(?:\?[^\s"'<>\\)]*)?/gi;
+    while ((m = r.exec(t))) addUniq(f.mp4, m[0]);
+}
+
+function isAdHost(u, siteBase) {
+    var h = hostOf(u);
+    if (h === hostOf(siteBase)) return true;
+    for (var i = 0; i < BASES.length; i++) if (hostOf(BASES[i]) === h) return true;
+    return /google|youtube|facebook|twitter|blogger|googletagmanager|cloudflare|shrgo|t\.ly|bit\.ly|cutt\.ly|sivo\.|rebrand|gshort|girgara|rogagir/.test(h);
+}
+
+function cookiesOnly(jarHost) {
+    var out = {};
+    var j = jars[jarHost] || {};
+    for (var k in j) if (/fireplayer/i.test(k)) out[k] = j[k];
+    return out;
+}
+
+// FirePlayer: POST <embed>/player/index.php?data=<id>&do=getVideo
+function fireVideo(embedUrl, pageUrl, id, found) {
+    var origin = originOf(embedUrl);
+    var url = origin + '/player/index.php?data=' + id + '&do=getVideo';
+    var h = {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        Referer: embedUrl,
+        'X-Requested-With': 'XMLHttpRequest',
+        Origin: origin,
+        Accept: 'application/json, text/javascript, */*; q=0.01'
+    };
+    function attempt(list) {
+        if (!list.length) return Promise.resolve();
+        var rf = list[0];
+        return http('POST', url, { headers: h, body: formBody({ hash: id, r: rf }) }).then(function (resp) {
+            var t = resp ? resp.text : '';
+            var c = cookiesOnly(hostOf(origin));
+            for (var k in c) found.cookies[k] = c[k];
+            try {
+                var o = JSON.parse(t);
+                ['videoSource', 'securedLink', 'source', 'file', 'url'].forEach(function (key) {
+                    var v = o[key];
+                    if (!v || v === 'null' || typeof v !== 'string') return;
+                    if (!/^(?:https?:)?\/\//i.test(v)) return;
+                    var u = fixText(v);
+                    if (u.indexOf('//') === 0) u = 'https:' + u;
+                    if (/\.mp4(?:\?|$)/i.test(u) && !o.hls) addUniq(found.mp4, u);
+                    else addUniq(found.hls, u);
+                });
+            } catch (e) {}
+            scan(t, origin, found);
+            if (found.hls.length || found.mp4.length) return;
+            return attempt(list.slice(1));
+        });
+    }
+    return attempt([pageUrl, '']);
 }
 
 function resolveEmbed(embedUrl, pageUrl, depth) {
-  var origin = originOf(embedUrl);
-  return fetchInfo(embedUrl, hdr(pageUrl), true).then(function (r) {
-    var texts = [r.text || ''].concat(unpackAll(r.text || ''));
-    texts = texts.concat(deepTexts(texts));
-    var xored = [];
-    texts.slice().forEach(function (x) { xorTexts(x).forEach(function (d) { if (xored.indexOf(d) === -1) xored.push(d); }); });
-    texts = texts.concat(xored);
-    var found = { hls: [], mp4: [], subs: [], origin: origin };
-    texts.forEach(function (t) {
-      var s = scanText(t, origin);
-      found.hls = found.hls.concat(s.hls); found.mp4 = found.mp4.concat(s.mp4); found.subs = found.subs.concat(s.subs);
-    });
-    // şifresi çözülen düz adres (.m3u8 uzantısı olmasa da) HLS sayılır
-    xored.forEach(function (d) {
-      var u = (d.match(/^\s*(https?:\/\/[^\s"'<>\\]+)/) || [])[1];
-      if (u && found.hls.indexOf(u) === -1 && found.mp4.indexOf(u) === -1 && !/\.(?:vtt|srt)(?:\?|$)/i.test(u)) found.hls.push(u);
-    });
-    if (xored.length) dbg.push('sifre cozuldu ' + xored.length + ' ' + xored[0].slice(0, 90));
-    found.hls = uniq(found.hls); found.mp4 = uniq(found.mp4);
-    dbg.push('embed ' + hostOf(embedUrl) + ' ' + (r.status || r.err) + ' ' + (r.text || '').length + 'b hls=' + found.hls.length + ' mp4=' + found.mp4.length + ' altyazi=' + found.subs.length);
-    function tail() {
-      if (!found.hls.length && !found.mp4.length) {
-        // Video adresi bulunamadı: embed sayfasındaki script'leri (zS01, zS02 ...) debug satırlarına dök
-        var raw = String(r.text || ''), parts = [], ms, rs = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
-        while ((ms = rs.exec(raw)) !== null) {
-          var body = ms[1].replace(/\s+/g, ' ').trim();
-          if (body.length > 40 && !/^eval\(function\(p,a,c,k,e,d\)/.test(body)) parts.push('[' + body.length + '] ' + body);
+    var origin = originOf(embedUrl);
+    var found = newFound(origin);
+    return http('GET', embedUrl, { headers: { Referer: pageUrl } }).then(function (r) {
+        var html = r ? r.text : '';
+        var c = cookiesOnly(hostOf(origin));
+        for (var k in c) found.cookies[k] = c[k];
+
+        var texts = [html];
+        unpackAll(html).forEach(function (x) {
+            texts.push(x);
+        });
+        deepTexts(texts).forEach(function (x) {
+            texts.push(x);
+        });
+        var xored = [];
+        texts.slice().forEach(function (x) {
+            xorTexts(x).forEach(function (d) {
+                addUniq(xored, d);
+            });
+        });
+        xored.forEach(function (x) {
+            texts.push(x);
+        });
+        texts.forEach(function (x) {
+            scan(x, origin, found);
+        });
+        // XOR ile çözülen düz adres (.m3u8 uzantısı olmasa da) HLS sayılır
+        xored.forEach(function (d) {
+            var m = /^\s*(https?:\/\/[^\s"'<>\\]+)/.exec(d);
+            var u = m ? m[1] : null;
+            if (u && found.hls.indexOf(u) < 0 && found.mp4.indexOf(u) < 0 && !/\.(?:vtt|srt)(?:\?|$)/i.test(u)) {
+                found.hls.push(u);
+            }
+        });
+
+        var next = Promise.resolve();
+        if (!found.hls.length && !found.mp4.length) {
+            var joined = texts.join('\n');
+            var fm = /FirePlayer\(\s*["']([A-Za-z0-9]{16,64})["']/.exec(joined);
+            var fid = fm ? fm[1] : null;
+            if (!fid && /FirePlayer|fireplay/i.test(html)) {
+                var vm = /\/video\/([A-Za-z0-9]{16,64})/.exec(embedUrl);
+                fid = vm ? vm[1] : null;
+            }
+            if (!fid) {
+                var im = /index\.php\?data=([A-Za-z0-9]{16,64})/.exec(joined);
+                fid = im ? im[1] : null;
+            }
+            if (fid) next = fireVideo(embedUrl, pageUrl, fid, found);
         }
-        unpackAll(raw).forEach(function (u) { parts.push('[ACILMIS ' + u.length + '] ' + String(u).replace(/\s+/g, ' ').trim()); });
-        var all = parts.join(' ¦ ').slice(0, 4200), zi = 0;
-        for (var zp = 0; zp < all.length; zp += 260) { zi++; dbg.push('zS' + (zi < 10 ? '0' : '') + zi + ' ' + all.slice(zp, zp + 260)); }
-      }
-      if (!found.hls.length && !found.mp4.length && (depth || 0) < 1) {     // iç içe iframe
-        var inner = findEmbeds(r.text || '');
-        if (inner.length) return resolveEmbed(inner[0], embedUrl, 1);
-      }
-      return found;
-    }
-    // FirePlayer (imagestoo vb.): video adresi sayfada değil, /player/index.php?do=getVideo isteğiyle gelir
-    var fid = null;
-    texts.forEach(function (x) { var fm = String(x).match(/FirePlayer\(\s*[\"']([A-Za-z0-9]{16,64})[\"']/); if (fm && !fid) fid = fm[1]; });
-    if (!fid && /FirePlayer|fireplay/i.test(r.text || '')) { var um = String(embedUrl).match(/\/video\/([A-Za-z0-9]{16,64})/); if (um) fid = um[1]; }
-    if (fid && !found.hls.length && !found.mp4.length) {
-      return fireVideo(embedUrl, pageUrl, fid).then(function (fv) {
-        fv.hls.forEach(function (u) { if (found.hls.indexOf(u) === -1) found.hls.push(u); });
-        fv.mp4.forEach(function (u) { if (found.mp4.indexOf(u) === -1) found.mp4.push(u); });
-        fv.subs.forEach(function (sb) { found.subs.push(sb); });
-        return tail();
-      });
-    }
-    return tail();
-  });
-}
-// FirePlayer: POST <embed>/player/index.php?data=<id>&do=getVideo  (hash=<id>&r=<sayfa>)  -> { videoSource, securedLink, ... }
-function fireVideo(embedUrl, pageUrl, id) {
-  var origin = originOf(embedUrl), url = origin + '/player/index.php?data=' + id + '&do=getVideo';
-  function attempt(rf) {
-    var h = hdr(embedUrl, { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', 'Origin': origin, 'Accept': 'application/json, text/javascript, */*; q=0.01' });
-    return postForm(url, 'hash=' + id + '&r=' + encodeURIComponent(rf), h).then(function (r) {
-      var t = r.text || '', o = null, hls = [], mp4 = [];
-      dbg.push('fp ' + (r.status || r.err) + ' ' + t.length + 'b ' + t.slice(0, 160).replace(/\s+/g, ' '));
-      try { o = JSON.parse(t); } catch (e) {}
-      if (o) ['videoSource', 'securedLink', 'source', 'file', 'url'].forEach(function (k) {
-        var v = o[k];
-        if (typeof v !== 'string' || !/^(?:https?:)?\/\//i.test(v)) return;
-        v = fixUrl(v);
-        if (/\.mp4(?:\?|$)/i.test(v) && o.hls !== true) mp4.push(v); else hls.push(v);
-      });
-      var sc = scanText(t.replace(/\\\//g, '/'), origin);
-      sc.hls.forEach(function (u) { hls.push(u); }); sc.mp4.forEach(function (u) { mp4.push(u); });
-      return { hls: uniq(hls), mp4: uniq(mp4), subs: sc.subs };
-    });
-  }
-  return attempt(pageUrl).then(function (a) {
-    if (a.hls.length || a.mp4.length) return a;
-    return attempt('').then(function (b) { return (b.hls.length || b.mp4.length) ? b : a; });
-  });
-}
-function qualOf(h) { return h ? h + 'p' : 'Auto'; }
-// Ana liste (master): ses seçenekleri, kalite varyantları ve yerleşik altyazı satırları
-function inspectHls1(url, ref, pre) {
-  return (pre ? Promise.resolve(pre) : fetchInfo(url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true)).then(function (r) {
-    var t = r.text || '', base = r.url || url;
-    if (AYAR.DEBUG_MODU) dumpLong('hM', t.replace(/https?:\/\/[^\s"']+\//g, '…/'), 110, 7);
-    if (t.indexOf('#EXT-X-STREAM-INF') === -1) { dbg.push('hls varyant yok ' + (r.status || r.err) + ' ' + t.length + 'b'); return { list: [{ url: url, quality: 'Auto', bad: t.indexOf('#EXTM3U') === -1 }], subs: [] }; }
-    var lines = t.split(/\r?\n/), vars = [], subs = [], audios = [], i, j;
-    var embedded = [];            // ana listedeki yerleşik altyazı satırları (adı / dili / adresi)
-    var subPlaylists = [];        // altyazı oynatma listeleri (.m3u8): tek parçalıysa doğrudan .vtt adresi çıkarılır
-    var subGroup = false;
-    for (i = 0; i < lines.length; i++) {
-      var ln = lines[i];
-      if (/^#EXT-X-STREAM-INF:/.test(ln)) {
-        var uri = '';
-        for (j = i + 1; j < lines.length; j++) { if (lines[j] && lines[j].charAt(0) !== '#') { uri = lines[j].trim(); break; } }
-        if (/SUBTITLES="/.test(ln)) subGroup = true;
-        if (uri) vars.push({ url: relUrl(uri, base), bw: parseInt((ln.match(/BANDWIDTH=(\d+)/) || [])[1], 10) || 0, h: parseInt((ln.match(/RESOLUTION=\d+x(\d+)/) || [])[1], 10) || 0 });
-      } else if (/^#EXT-X-MEDIA:/.test(ln) && /TYPE=SUBTITLES/.test(ln)) {
-        var su = (ln.match(/URI="([^"]+)"/) || [])[1];
-        var sName = (ln.match(/NAME="([^"]+)"/) || [])[1] || (ln.match(/LANGUAGE="([^"]+)"/) || [])[1] || '';
-        embedded.push(sName || 'altyazi');
-        if (su && /\.(vtt|srt)(\?|$)/i.test(su)) subs.push(mkSub(relUrl(su, base), sName));
-        else if (su) subPlaylists.push({ url: relUrl(su, base), name: sName });
-      } else if (/^#EXT-X-MEDIA:/.test(ln) && /TYPE=AUDIO/.test(ln)) {
-        audios.push({ name: (ln.match(/NAME="([^"]+)"/) || [])[1] || '', lang: (ln.match(/LANGUAGE="([^"]+)"/) || [])[1] || '' });
-      }
-    }
-    var best = vars.reduce(function (a, v) { return (!a || v.h > a.h || (v.h === a.h && v.bw > a.bw)) ? v : a; }, null);
-    var hasNativeSubs = embedded.length > 0 || subGroup;
-    var byAudio = {};
-    vars.forEach(function (v) {
-      var m = v.url.match(/-a(\d+)\.m3u8/i);
-      if (m) { var k = parseInt(m[1], 10); if (!byAudio[k] || v.bw > byAudio[k].bw || v.h > byAudio[k].h) byAudio[k] = v; }
-    });
-    var keys = Object.keys(byAudio).map(Number).sort(function (a, b) { return a - b; }), list;
-    dbg.push('hls ' + vars.length + ' varyant ses=' + keys.join(',') + ' mediaSes=' + audios.length + (audios.length ? '(' + audios.map(function (a) { return a.lang || a.name; }).join(',') + ')' : '') + ' altyazi=' + subs.length + ' en=' + (best ? best.h : 0) + 'p');
-    if (audios.length) {
-      // sesler ana listede ayrı parça: ana liste verilir, ses/altyazı oynatıcının menüsünden seçilir
-      list = [{ url: url, quality: qualOf(best && best.h), seslist: audios.map(function (a) { return a.name || a.lang; }).join(', ') }];
-    } else if (keys.length && AYAR.SES_SIRA && byAudio[AYAR.SES_SIRA]) {
-      list = [{ url: byAudio[AYAR.SES_SIRA].url, quality: qualOf(byAudio[AYAR.SES_SIRA].h), ses: AYAR.SES_SIRA }];
-    } else if (keys.length) {
-      list = keys.map(function (k) { return { url: byAudio[k].url, quality: qualOf(byAudio[k].h), ses: keys.length > 1 ? k : 0 }; });   // her ses parçası ayrı akış
-    } else {
-      list = [{ url: url, quality: qualOf(best && best.h) }];
-    }
-    // Ana listede yerleşik altyazı varsa ana liste de ayrıca verilir: oynatıcı altyazı parçasını (ör. "Turkish") kendi menüsünde gösterir.
-    // (Alt liste / ses varyantı adresleri altyazıyı taşımaz.)
-    if (hasNativeSubs && !audios.length) {
-      list.unshift({ url: url, quality: qualOf(best && best.h), native: true, subnames: embedded.join(', ') });
-    }
-    var sres = { list: list, subs: subs, variants: vars.map(function (v) { return v.url; }), embedded: embedded };
-    // altyazı oynatma listeleri (.m3u8): tek parça (= tüm film tek .vtt) ise doğrudan dosya adresi alınır
-    var spj = subPlaylists.slice(0, 3).map(function (sp) {
-      return fetchInfo(sp.url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true).then(function (sr) {
-        var segs = String(sr.text || '').split(/\r?\n/).filter(function (l) { return l && l.charAt(0) !== '#'; });
-        dbg.push('altyazi liste ' + sp.name + ' ' + (sr.status || sr.err) + ' parca=' + segs.length);
-        if (segs.length === 1 && /\.(vtt|srt|webvtt)(\?|$)/i.test(segs[0])) sres.subs.push(mkSub(relUrl(segs[0], sr.url || sp.url), sp.name));
-      });
-    });
-    return waitWithin(spj, 3500).then(function () { return sres; });
-  });
-}
-// Liste yalnızca doğru Referer ile iniyorsa (embed sitesi / Dizipal sayfası): ikisi paralel denenir, çalışan seçilir (tek tur)
-function inspectHls(url, ref, alt) {
-  function probe(r0) { return fetchInfo(url, hdr(r0, { 'Origin': String(r0).replace(/\/$/, '') }), true); }
-  var useAlt = alt && alt !== ref;
-  return Promise.all([probe(ref), useAlt ? probe(alt) : Promise.resolve(null)]).then(function (rs) {
-    var ok0 = (rs[0].text || '').indexOf('#EXTM3U') > -1, ok1 = rs[1] && (rs[1].text || '').indexOf('#EXTM3U') > -1;
-    dbg.push('hls m3 ' + (rs[0].status || rs[0].err) + '/' + (rs[0].text || '').length + 'b' + (rs[1] ? ' alt=' + (rs[1].status || rs[1].err) + '/' + (rs[1].text || '').length + 'b' : '') + ' ilk=' + String(rs[0].text || '').slice(0, 20).replace(/\s+/g, ' '));
-    if (!ok0 && ok1) return inspectHls1(url, alt, rs[1]).then(function (x) { x.ref = alt; return x; });
-    return inspectHls1(url, ref, rs[0]);
-  });
-}
-// /hls2/01/00009/<kod>_h/...  ->  /vtt/01/00009/<kod>_tur.vtt
-function guessVtt(u) {
-  var m = String(u).match(/^(https?:\/\/[^\/]+)\/hls\d*\/(\d+)\/(\d+)\/([a-z0-9]+)_[^\/]*\//i);
-  var out = [];
-  if (m) out = ['tur', 'tr', 'eng'].map(function (l) { return mkSub(m[1] + '/vtt/' + m[2] + '/' + m[3] + '/' + m[4] + '_' + l + '.vtt', l); });
-  // klasör içi genel tahminler: <klasör>/tur.vtt, <üst klasör>/tur.vtt
-  var d1 = String(u).replace(/[?#].*$/, '').replace(/\/[^\/]*$/, ''), d2 = d1.replace(/\/[^\/]*$/, '');
-  if (/^https?:\/\/[^\/]+\/./.test(d1)) {
-    [d1, d2].forEach(function (d) { if (/^https?:\/\/[^\/]+\/./.test(d)) ['tur', 'tr'].forEach(function (l) { out.push(mkSub(d + '/' + l + '.vtt', l)); }); });
-  }
-  return out;
-}
-function utf8Bytes(str) {
-  var out = [], i, c;
-  str = String(str || '');
-  for (i = 0; i < str.length; i++) {
-    c = str.charCodeAt(i);
-    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) c = 0x10000 + ((c - 0xD800) << 10) + (str.charCodeAt(++i) - 0xDC00);
-    if (c < 0x80) out.push(c);
-    else if (c < 0x800) out.push(0xC0 | (c >> 6), 0x80 | (c & 63));
-    else if (c < 0x10000) out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-    else out.push(0xF0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-  }
-  return out;
-}
-function b64enc(bytes) {
-  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/', r = '', i, a, b, c;
-  for (i = 0; i < bytes.length; i += 3) {
-    a = bytes[i]; b = bytes[i + 1]; c = bytes[i + 2];
-    r += C.charAt(a >> 2) + C.charAt(((a & 3) << 4) | ((b || 0) >> 4)) + (i + 1 < bytes.length ? C.charAt(((b & 15) << 2) | ((c || 0) >> 6)) : '=') + (i + 2 < bytes.length ? C.charAt(c & 63) : '=');
-  }
-  return r;
-}
-function cueCount(t) { return (String(t || '').match(/-->/g) || []).length; }
-// SRT ise WebVTT'ye çevir; WebVTT'deki X-TIMESTAMP-MAP (HLS kayması) satırını sil
-function toVtt(t) {
-  t = String(t || '').replace(/^\uFEFF/, '');
-  if (!/^\s*WEBVTT/.test(t)) t = 'WEBVTT\n\n' + t.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
-  return t.replace(/^X-TIMESTAMP-MAP=[^\r\n]*[\r\n]*/m, '');
-}
-// Altyazıyı Nuvio'nun göreceği şekilde dene: başlıksız (Referer/Origin yok) indirilebiliyor mu, içinde replik var mı?
-// Başlıklarla iner ama başlıksız inmiyorsa (oynatıcı altyazıyı başlıksız ister) içerik doğrudan data: adresi olarak da verilir.
-var subNote = '';            // son altyazı durumu (DEBUG_MODU'nda akış adında görünür)
-var REHOST_CACHE = {};
-function plainOk(u) {
-  return fetchInfo(u, { 'User-Agent': 'ExoPlayer' }, true).then(function (r) { var t = r.text || ''; return r.status === 200 && /^\s*WEBVTT/.test(t) && cueCount(t) > 0; });
-}
-// Başlıksız erişilebilir bir adres üret: paste sitelerine yükle, yüklenen adresi başlıksız indirip doğrula
-function rehostVtt(vtt) {
-  if (!AYAR.ALTYAZI_BARINDIR) return Promise.resolve('');
-  var providers = [
-    { n: 'paste.rs', run: function () {
-        return postForm('https://paste.rs', vtt, { 'Content-Type': 'text/plain; charset=utf-8', 'User-Agent': UA }).then(function (r) {
-          var u = String(r.text || '').trim().split(/\s+/)[0];
-          return /^https?:\/\/paste\.rs\/[A-Za-z0-9]+$/.test(u) ? u + '.vtt' : '';
+        return next.then(function () {
+            // iç içe iframe
+            if (!found.hls.length && !found.mp4.length && depth < 1) {
+                var re = /<iframe[^>]+src=["']([^"']+)["']/gi;
+                var m;
+                var inner = null;
+                while ((m = re.exec(html))) {
+                    var u = resolveUrl(embedUrl, fixText(m[1]));
+                    if (/^https?:/i.test(u) && !isAdHost(u, mainUrl)) {
+                        inner = u;
+                        break;
+                    }
+                }
+                if (inner) return resolveEmbed(inner, embedUrl, depth + 1);
+            }
+            return found;
         });
-    } },
-    { n: 'dpaste.com', run: function () {
-        return postForm('https://dpaste.com/api/v2/', 'syntax=text&expiry_days=3&content=' + encodeURIComponent(vtt), { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'User-Agent': UA }).then(function (r) {
-          var u = String(r.text || '').trim().split(/\s+/)[0];
-          return /^https?:\/\/dpaste\.com\/[A-Za-z0-9]+$/.test(u) ? u + '.txt' : '';
-        });
-    } },
-    { n: 'pastes.dev', run: function () {
-        return postForm('https://api.pastes.dev/post', vtt, { 'Content-Type': 'text/plain; charset=utf-8', 'User-Agent': UA }).then(function (r) {
-          var k = ''; try { k = JSON.parse(r.text).key || ''; } catch (e) {}
-          return k ? 'https://api.pastes.dev/' + k : '';
-        });
-    } }
-  ];
-  function next(i) {
-    if (i >= providers.length) return Promise.resolve('');
-    return providers[i].run().then(function (u) {
-      if (!u) { dbg.push('barindir ' + providers[i].n + ' yok'); return next(i + 1); }
-      return plainOk(u).then(function (ok) {
-        dbg.push('barindir ' + providers[i].n + ' ' + (ok ? 'OK ' : 'DOGRULANAMADI ') + u);
-        if (ok) { subNote = 'yuklendi:' + providers[i].n; return u; }
-        return next(i + 1);
-      });
-    }, function () { return next(i + 1); });
-  }
-  return next(0);
+    });
 }
 
-// Altyazıyı Nuvio'nun göreceği şekilde dene: başlıksız (Referer/Origin yok) indirilebiliyor mu, içinde replik var mı?
-// Başlıksız inmiyorsa: (1) metni başlıksız erişilebilir bir adrese yükle, (2) olmazsa orijinal adres + data: adresi ver.
-function checkSub(sb, ref, allowRehost) {
-  var h = hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') });
-  return Promise.all([fetchInfo(sb.url, h, true), fetchInfo(sb.url, { 'User-Agent': 'ExoPlayer' }, true)]).then(function (rs) {
-    var a = rs[0], b = rs[1], at = a.text || '', bt = b.text || '';
-    var aOk = a.status === 200 && cueCount(at) > 0, bOk = b.status === 200 && /^\s*WEBVTT/.test(bt) && cueCount(bt) > 0;
-    dbg.push('altyazi test ' + sb.lang + ' basliklı=' + (a.status || a.err) + '/' + at.length + 'b/' + cueCount(at) + 'replik basliksiz=' + (b.status || b.err) + '/' + bt.length + 'b/' + cueCount(bt) + 'replik ilk=' + at.slice(0, 14).replace(/\s+/g, ' '));
-    if (!aOk) { subNote = 'bos/erisilemez'; return []; }             // boş / erişilemeyen altyazı listeye girmez
-    if (bOk) { if (!subNote) subNote = 'acik'; return [sb]; }        // başlıksız da iniyor: olduğu gibi
-    // Yalnızca "(kaynak)" altyazısı verilir (yeniden barındırılan kopya ve gömülü kopya kaldırıldı)
-    subNote = 'kaynak';
-    return [{ url: sb.url, lang: sb.lang, label: sb.label + ' (kaynak)', withHeaders: true }];
-  }).catch(function () { return [sb]; });
-}
-function verifySub(s, ref) {
-  return fetchInfo(s.url, hdr(ref, { 'Origin': String(ref).replace(/\/$/, '') }), true).then(function (r) { var ok = r.status === 200 && /^\s*WEBVTT/.test(r.text || ''); dbg.push('altyazi ' + s.lang + ' ' + (r.status || r.err) + (ok ? ' ok' : ' yok')); return ok ? s : null; });
+// ------------------------------------------------------------------
+// Akış üretimi
+// ------------------------------------------------------------------
+function ckHeader(cookies) {
+    var a = [];
+    for (var k in cookies) a.push(k + '=' + cookies[k]);
+    return a.join('; ');
 }
 
+function mkHeaders(ref, cookies) {
+    var h = { 'User-Agent': UA, Referer: ref, Origin: ref.replace(/\/$/, '') };
+    var ck = ckHeader(cookies || {});
+    if (ck) h.Cookie = ck;
+    return h;
+}
 
-// ---------------- Oyuncu ayarı: /ajax-player-config (AES-CBC, anahtar = k1 XOR k2) ----------------
-function b64bytes(s) {
-  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+\/]/g, '');
-  var out = [], bits = 0, val = 0, i;
-  for (i = 0; i < s.length; i++) {
-    val = ((val << 6) | C.indexOf(s.charAt(i))) & 0xffffff;
-    bits += 6;
-    if (bits >= 8) { bits -= 8; out.push((val >> bits) & 255); }
-  }
-  return out;
+function mkStream(url, h, label, headers) {
+    return {
+        name: 'Dizipal',
+        title: label,
+        url: url,
+        quality: h > 0 ? h + 'p' : 'Auto',
+        headers: headers,
+        provider: 'dizipal'
+    };
 }
-var AES = { sb: null, isb: null };
-function aesInit() {
-  if (AES.sb) return;
-  var sb = new Array(256), isb = new Array(256), p = 1, q = 1, x;
-  function rotl(v, n) { return ((v << n) | (v >> (8 - n))) & 255; }
-  do {
-    p = (p ^ ((p << 1) & 255) ^ ((p & 0x80) ? 0x1b : 0)) & 255;
-    q ^= (q << 1) & 255; q ^= (q << 2) & 255; q ^= (q << 4) & 255; if (q & 0x80) q ^= 0x09;
-    x = q ^ rotl(q, 1) ^ rotl(q, 2) ^ rotl(q, 3) ^ rotl(q, 4);
-    sb[p] = (x ^ 0x63) & 255;
-  } while (p !== 1);
-  sb[0] = 0x63;
-  for (x = 0; x < 256; x++) isb[sb[x]] = x;
-  AES.sb = sb; AES.isb = isb;
+
+function emitMp4(url, refBase, cookies) {
+    var ref = refBase.replace(/\/$/, '') + '/';
+    return [mkStream(url, 0, 'Dizipal', mkHeaders(ref, cookies))];
 }
-function gmul(a, b) { var r = 0; while (b) { if (b & 1) r ^= a; a = ((a << 1) ^ ((a & 0x80) ? 0x11b : 0)) & 255; b >>= 1; } return r; }
-function aesCbcDecrypt(key, iv, data) {
-  aesInit();
-  var sb = AES.sb, isb = AES.isb, nk = key.length / 4;
-  if (nk !== 4 && nk !== 6 && nk !== 8) return null;
-  if (!data.length || data.length % 16 || iv.length !== 16) return null;
-  var nr = nk + 6, w = key.slice(), i, j, r, c, t, rcon = 1;
-  for (i = nk; i < 4 * (nr + 1); i++) {
-    t = [w[4 * i - 4], w[4 * i - 3], w[4 * i - 2], w[4 * i - 1]];
-    if (i % nk === 0) { t = [sb[t[1]] ^ rcon, sb[t[2]], sb[t[3]], sb[t[0]]]; rcon = ((rcon << 1) ^ ((rcon & 0x80) ? 0x11b : 0)) & 255; }
-    else if (nk > 6 && i % nk === 4) t = [sb[t[0]], sb[t[1]], sb[t[2]], sb[t[3]]];
-    for (j = 0; j < 4; j++) w[4 * i + j] = w[4 * (i - nk) + j] ^ t[j];
-  }
-  var out = [], prev = iv.slice(), off, blk, s, u, a0, a1, a2, a3;
-  for (off = 0; off < data.length; off += 16) {
-    blk = data.slice(off, off + 16); s = blk.slice();
-    for (j = 0; j < 16; j++) s[j] ^= w[16 * nr + j];
-    for (r = nr - 1; r >= 0; r--) {
-      u = s.slice();
-      for (c = 0; c < 4; c++) for (j = 0; j < 4; j++) s[4 * c + j] = u[4 * ((c - j + 4) % 4) + j];
-      for (j = 0; j < 16; j++) s[j] = isb[s[j]];
-      for (j = 0; j < 16; j++) s[j] ^= w[16 * r + j];
-      if (r > 0) {
-        for (c = 0; c < 4; c++) {
-          a0 = s[4 * c]; a1 = s[4 * c + 1]; a2 = s[4 * c + 2]; a3 = s[4 * c + 3];
-          s[4 * c]     = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
-          s[4 * c + 1] = gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13);
-          s[4 * c + 2] = gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11);
-          s[4 * c + 3] = gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14);
+
+// Ana liste (master): kalite varyantları ve ses seçenekleri
+function emitHls(url, refBase, pageBase, cookies) {
+    var ref = refBase.replace(/\/$/, '') + '/';
+    var ck = cookies || {};
+    var fetchBody = function (r) {
+        return getText(url, mkHeaders(r, ck));
+    };
+    return fetchBody(ref).then(function (body) {
+        if (body.indexOf('#EXTM3U') >= 0 || pageBase.replace(/\/$/, '') === refBase.replace(/\/$/, '')) return body;
+        var alt = pageBase.replace(/\/$/, '') + '/';
+        return fetchBody(alt).then(function (b2) {
+            if (b2.indexOf('#EXTM3U') >= 0) {
+                ref = alt;
+                return b2;
+            }
+            return body;
+        });
+    }).then(function (body) {
+        if (body.indexOf('#EXTM3U') >= 0 || Object.keys(ck).length) return body;
+        // Yedek: oynatıcı sunucusu çerez istiyorsa ana adresine uğrayıp fireplayer_* çerezini al
+        var own = originOf(url) + '/';
+        return http('GET', own, { headers: { Referer: ref } }).then(function () {
+            var c2 = cookiesOnly(hostOf(url));
+            if (!Object.keys(c2).length) return body;
+            ck = c2;
+            return fetchBody(own).then(function (b3) {
+                if (b3.indexOf('#EXTM3U') >= 0) {
+                    ref = own;
+                    return b3;
+                }
+                return body;
+            });
+        });
+    }).then(function (body) {
+        var headers = mkHeaders(ref, ck);
+        var vars = [];
+        var hasAudio = false;
+        var lines = body.split(/\r?\n/);
+        for (var i = 0; i < lines.length; i++) {
+            var ln = lines[i];
+            if (ln.indexOf('#EXT-X-STREAM-INF:') === 0) {
+                var uri = '';
+                for (var j = i + 1; j < lines.length; j++) {
+                    var l = lines[j].trim();
+                    if (l && l.charAt(0) !== '#') {
+                        uri = l;
+                        break;
+                    }
+                }
+                if (uri) {
+                    var bw = /BANDWIDTH=(\d+)/.exec(ln);
+                    var rs = /RESOLUTION=\d+x(\d+)/.exec(ln);
+                    vars.push({ url: resolveUrl(url, uri), bw: bw ? parseInt(bw[1], 10) : 0, h: rs ? parseInt(rs[1], 10) : 0 });
+                }
+            } else if (ln.indexOf('#EXT-X-MEDIA:') === 0 && ln.indexOf('TYPE=AUDIO') >= 0) {
+                hasAudio = true;
+            }
         }
-      }
+        if (!vars.length) return [mkStream(url, 0, 'Dizipal', headers)];
+
+        var best = vars.slice().sort(function (a, b) {
+            return b.h - a.h || b.bw - a.bw;
+        })[0];
+        var byAudio = {};
+        vars.forEach(function (v) {
+            var m = /-a(\d+)\.m3u8/i.exec(v.url);
+            if (!m) return;
+            var k = parseInt(m[1], 10);
+            var cur = byAudio[k];
+            if (!cur || v.h > cur.h || (v.h === cur.h && v.bw > cur.bw)) byAudio[k] = v;
+        });
+        var keys = Object.keys(byAudio).map(Number).sort(function (a, b) {
+            return a - b;
+        });
+        if (hasAudio || !keys.length) return [mkStream(url, best.h, 'Dizipal', headers)];
+        return keys.map(function (k) {
+            return mkStream(byAudio[k].url, byAudio[k].h, keys.length > 1 ? 'Dizipal Ses ' + k : 'Dizipal', headers);
+        });
+    });
+}
+
+// Sayfadaki oynatıcıdan akışları çıkar (CloudStream loadLinks karşılığı)
+function linksFromPage(site, path) {
+    var pageUrl = site.base + path;
+    return playerConfig(site, pageUrl).then(function (cfg) {
+        var streams = [];
+        var embeds = [];
+        var pageFound = newFound(site.base);
+        var chain = Promise.resolve();
+        var any = false;
+        var add = function (arr) {
+            if (arr && arr.length) {
+                any = true;
+                streams = streams.concat(arr);
+            }
+        };
+
+        if (cfg) {
+            scan(cfg.raw + ' ' + cfg.v, site.base, pageFound);
+            var t = cfg.t.toLowerCase();
+            var v = fixText(cfg.v).trim();
+            if (t === 'm3u8') {
+                chain = chain.then(function () {
+                    return emitHls(v, site.base, site.base, {}).then(add);
+                });
+            } else if (t === 'mp4') {
+                add(emitMp4(v, site.base, {}));
+            } else if (/<iframe/i.test(v)) {
+                var im = /<iframe[^>]+src=["']([^"']+)["']/i.exec(v);
+                if (im) embeds.push(resolveUrl(site.base, fixText(im[1])).replace(/#.*$/, ''));
+            } else if (/^https?:/i.test(v) || v.indexOf('//') === 0) {
+                var u = v.indexOf('//') === 0 ? 'https:' + v : v;
+                if (/\.m3u8/i.test(u)) {
+                    chain = chain.then(function () {
+                        return emitHls(u, site.base, site.base, {}).then(add);
+                    });
+                } else embeds.push(u.replace(/#.*$/, ''));
+            }
+        }
+
+        return chain.then(function () {
+            if (!embeds.length && !any) {
+                var re = /<iframe[^>]+src=["']([^"']+)["']/gi;
+                var m;
+                while ((m = re.exec(site.text))) {
+                    var u2 = resolveUrl(site.base, fixText(m[1]));
+                    if (/^https?:/i.test(u2) && !isAdHost(u2, site.base)) embeds.push(u2);
+                }
+            }
+            var uniq = embeds.filter(function (e, i) {
+                return embeds.indexOf(e) === i;
+            }).slice(0, 3);
+            return seq(uniq, function (embed) {
+                return resolveEmbed(embed, pageUrl, 0).then(function (found) {
+                    return seq(found.hls.slice(0, 3), function (u3) {
+                        return emitHls(u3, found.origin, site.base, found.cookies).then(add);
+                    }).then(function () {
+                        found.mp4.slice(0, 2).forEach(function (u4) {
+                            add(emitMp4(u4, found.origin, found.cookies));
+                        });
+                    });
+                });
+            });
+        }).then(function () {
+            var seen = {};
+            return streams.filter(function (s) {
+                if (seen[s.url]) return false;
+                seen[s.url] = 1;
+                return true;
+            });
+        });
+    });
+}
+
+// ------------------------------------------------------------------
+// TMDB -> başlık -> site araması
+// ------------------------------------------------------------------
+function normTitle(s) {
+    return String(s || '')
+        .replace(/İ/g, 'i').replace(/I/g, 'i').replace(/ı/g, 'i')
+        .toLowerCase()
+        .replace(/ğ/g, 'g').replace(/ü/g, 'u').replace(/ş/g, 's').replace(/ö/g, 'o').replace(/ç/g, 'c')
+        .replace(/[^a-z0-9]+/g, '');
+}
+
+function tmdbTitles(tmdbId, isMovie) {
+    if (!TMDB_KEY || TMDB_KEY.indexOf('BURAYA') === 0) return Promise.resolve(null);
+    var kind = isMovie ? 'movie' : 'tv';
+    var url = 'https://api.themoviedb.org/3/' + kind + '/' + tmdbId + '?api_key=' + TMDB_KEY + '&language=tr-TR';
+    return getText(url, { Accept: 'application/json' }).then(function (t) {
+        try {
+            var o = JSON.parse(t);
+            var tr = isMovie ? o.title : o.name;
+            var orig = isMovie ? o.original_title : o.original_name;
+            var out = [];
+            if (tr) out.push(tr);
+            if (orig && out.indexOf(orig) < 0) out.push(orig);
+            return out.length ? out : null;
+        } catch (e) {
+            return null;
+        }
+    });
+}
+
+function parseCards(html) {
+    var out = [];
+    var parts = html.split('content-card');
+    for (var i = 1; i < parts.length; i++) {
+        var chunk = parts[i].slice(0, 1500);
+        var hm = /href=["'](\/(?:film|dizi|anime)\/[^"'#?]+)["']/i.exec(chunk) ||
+            /href=["'](https?:\/\/[^"']+\/(?:film|dizi|anime)\/[^"'#?]+)["']/i.exec(chunk);
+        if (!hm) continue;
+        var tm = /class=["'][^"']*card-title[^"']*["'][^>]*>\s*([^<]+)/i.exec(chunk) ||
+            /<img[^>]*\balt=["']([^"']+)["']/i.exec(chunk);
+        if (!tm) continue;
+        var href = hm[1].replace(/^https?:\/\/[^\/]+/i, '');
+        out.push({ path: href, title: decodeEntities(tm[1]).replace(/\s*[-|–]\s*Dizipal.*$/i, '').replace(/\s+izle$/i, '').trim() });
     }
-    for (j = 0; j < 16; j++) out.push(s[j] ^ prev[j]);
-    prev = blk;
-  }
-  var pad = out[out.length - 1];
-  if (!(pad >= 1 && pad <= 16)) return null;
-  out.length -= pad;
-  return out;
-}
-function bytesToStr(b) {
-  try { return decodeURIComponent(b.map(function (x) { return '%' + ('0' + x.toString(16)).slice(-2); }).join('')); }
-  catch (e) { return b.map(function (x) { return String.fromCharCode(x); }).join(''); }
-}
-function decryptEnc(enc) {
-  try {
-    var k1 = b64bytes(enc.k1), k2 = b64bytes(enc.k2), iv = b64bytes(enc.iv), ct = b64bytes(enc.c), n = Math.min(k1.length, k2.length), key = [], i;
-    for (i = 0; i < n; i++) key.push(k1[i] ^ k2[i]);
-    var plain = aesCbcDecrypt(key, iv, ct);
-    if (!plain && n > 32) plain = aesCbcDecrypt(key.slice(0, 32), iv, ct);
-    return plain ? bytesToStr(plain) : null;
-  } catch (e) { return null; }
-}
-function postForm(url, body, headers) {
-  return withTimeout(fetch(url, { method: 'POST', headers: headers, body: body }), 5000).then(function (res) {
-    return withTimeout(res.text(), 6000).then(
-      function (t) { return { status: res.status, text: t || '' }; },
-      function () { return { status: res.status, text: '' }; });
-  }).catch(function (e) { return { status: 0, text: '', err: (e && e.message) || 'hata' }; });
-}
-function dumpLong(tag, str, size, max) {
-  str = String(str || '').replace(/\s+/g, ' ');
-  for (var i = 0; i < max && i * size < str.length; i++) dbg.push(tag + (i + 1) + ' ' + str.substr(i * size, size));
-}
-// Sayfadaki #videoContainer[data-cfg] -> POST /ajax-player-config -> { t, v, p }
-function parseConfigResp(r, tag) {
-  var o = null; try { o = JSON.parse(r.text); } catch (e) {}
-  if (!o) { dbg.push(tag + ' ' + (r.status || r.err) + ' ' + r.text.length + 'b ' + r.text.slice(0, 90).replace(/\s+/g, ' ')); return null; }
-  var c = o.config || {};
-  if (o.enc) { var v = decryptEnc(o.enc); dbg.push(tag + ' sifre ' + (v ? 'ok' : 'COZULEMEDI')); if (v) c.v = v; }
-  if (!c.v) { dbg.push(tag + ' ' + (r.status || r.err) + ' ' + JSON.stringify(o).slice(0, 110)); return null; }
-  // yanıtın tamamında (config alanları + çözülen metin) altyazı ara: tracks / subtitle / sub / captions ...
-  try {
-    var extra = [r.text, o.enc ? String(c.v) : '', JSON.stringify(c)];
-    var more = deepTexts(extra);
-    c._subs = [];
-    extra.concat(more).forEach(function (tx) { scanText(tx, '').subs.forEach(function (sb) { if (!c._subs.some(function (q) { return q.url === sb.url; })) c._subs.push(sb); }); });
-    Object.keys(o).concat(Object.keys(c)).forEach(function (k) {
-      if (!/^(sub|subs|subtitle|subtitles|tracks|captions|cc|altyazi|vtt)$/i.test(k)) return;
-      var val = o[k] !== undefined ? o[k] : c[k];
-      var list = Array.isArray(val) ? val : [val];
-      list.forEach(function (x) {
-        var u = typeof x === 'string' ? x : (x && (x.file || x.url || x.src)) || '';
-        var lb = (x && typeof x === 'object') ? (x.label || x.lang || x.language || x.srclang || '') : '';
-        u = fixUrl(u);
-        if (/^https?:/i.test(u) && !c._subs.some(function (q) { return q.url === u; })) c._subs.push(mkSub(u, lb));
-      });
-    });
-    if (c._subs.length) dbg.push(tag + ' altyazi ' + c._subs.length + ' ' + c._subs[0].url.slice(0, 80));
-  } catch (e) {}
-  dbg.push(tag + ' oyuncu t=' + (c.t || 'embed') + ' ' + String(c.v).slice(0, 100));
-  return c;
-}
-function getPlayerConfig(html, base, pageUrl, pageCookie) {
-  html = String(html || '');
-  var tag = html.match(/<[^>]*id=["']videoContainer["'][^>]*>/i);
-  var cm = (tag && tag[0].match(/data-cfg=["']([^"']+)["']/i)) || html.match(/data-cfg=["']([^"']+)["']/i);
-  if (!cm) { dbg.push('cfg yok'); return Promise.resolve(null); }
-  var cfg = decodeHtml(cm[1]), url = base + '/ajax-player-config';
-  var csrfM = html.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i);
-  var csrf = csrfM ? csrfM[1] : '';
-  dbg.push('cfg ' + cfg.length + ' cookie=' + (pageCookie ? pageCookie.length : 0) + ' csrf=' + (csrf ? 1 : 0));
-  var ct = 'application/x-www-form-urlencoded; charset=UTF-8';
-  function H(extra) { return hdr(pageUrl, extra); }
-  // A: tarayıcıdaki gibi
-  var hA = { 'Content-Type': ct, 'X-Requested-With': 'XMLHttpRequest', 'Origin': base, 'Accept': 'application/json, text/javascript, */*; q=0.01' };
-  if (pageCookie) hA['Cookie'] = pageCookie;
-  return postForm(url, 'cfg=' + encodeURIComponent(cfg), H(hA)).then(function (r) {
-    var c = parseConfigResp(r, 'A');
-    if (c) return c;
-    // B: ajax-token + csrf
-    return fetchInfo(base + '/ajax-token', H({ 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json', 'Cookie': pageCookie || '' }), true).then(function (tr) {
-      var tok = ''; try { tok = JSON.parse(tr.text).t || ''; } catch (e) {}
-      dbg.push('token ' + (tr.status || tr.err) + ' ' + (tok ? tok.length : 0) + ' cookie=' + (tr.cookie ? 1 : 0));
-      var ck = [pageCookie, tr.cookie, tok ? '_ct=' + tok : ''].filter(Boolean).join('; ');
-      var hB = { 'Content-Type': ct, 'X-Requested-With': 'XMLHttpRequest', 'Origin': base, 'Accept': 'application/json, text/javascript, */*; q=0.01' };
-      if (ck) hB['Cookie'] = ck;
-      if (csrf || tok) hB['X-CSRF-Token'] = csrf || tok;
-      var body = 'cfg=' + encodeURIComponent(cfg) + (tok ? '&token=' + encodeURIComponent(tok) + '&csrf_token=' + encodeURIComponent(tok) : (csrf ? '&csrf_token=' + encodeURIComponent(csrf) : ''));
-      return postForm(url, body, H(hB)).then(function (r2) {
-        var c2 = parseConfigResp(r2, 'B');
-        if (c2) return c2;
-        // C: sade istek
-        return postForm(url, 'cfg=' + encodeURIComponent(cfg), { 'Content-Type': ct, 'User-Agent': UA, 'Referer': pageUrl }).then(function (r3) { return parseConfigResp(r3, 'C'); });
-      });
-    });
-  });
-}
-function configTargets(c, base) {
-  var t = String(c.t || 'embed').toLowerCase(), v = String(c.v || ''), res = { embeds: [], direct: null, subs: (c._subs || []).slice() }, u;
-  if (t === 'm3u8' || t === 'mp4') {
-    u = fixUrl(v);
-    res.direct = { hls: t === 'm3u8' ? [u] : [], mp4: t === 'mp4' ? [u] : [], subs: (c._subs || []).slice(), origin: base };
-  } else if (v.indexOf('<iframe') > -1) {
-    var m = v.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-    if (m) res.embeds = [fixUrl(m[1]).split('#')[0]];
-  } else {
-    u = fixUrl(v).split('#')[0];
-    if (/^https?:/i.test(u)) res.embeds = [u];
-  }
-  return res;
+    return out;
 }
 
-// ---------------- Ana akış ----------------
-function debugStream(msg) {
-  if (!AYAR.DEBUG_MODU) return [];
-  return [msg].concat(dbg.slice(0, 120)).map(function (r, i) {
-    return { name: 'DEBUG ' + r, title: 'DEBUG ' + r, url: 'https://debug.invalid/' + i, quality: 'Auto', provider: PROVIDER_ID };
-  });
-}
-function buildStreams(found, pageUrl, label) {
-  var ref = (found.origin || originOf(pageUrl)) + '/';
-  var headers = { 'User-Agent': UA, 'Referer': ref, 'Origin': ref.replace(/\/$/, '') };
-  var subsAll = found.subs.slice(), items = [];
-  var hlsJobs = found.hls.slice(0, 3).map(function (u) {
-    return inspectHls(u, ref, originOf(pageUrl) + '/').then(function (x) {
-      x.list.forEach(function (it) { items.push({ bad: it.bad, hh: x.ref, url: it.url, quality: it.quality, ses: it.ses, seslist: it.seslist, native: it.native, subnames: it.subnames, src: u }); });
-      subsAll = subsAll.concat(x.subs);
-      guessVtt(u).concat((x.variants || []).slice(0, 1).reduce(function (a, v) { return a.concat(guessVtt(v)); }, [])).forEach(function (g) { subsAll.push(g); });
-    });
-  });
-  found.mp4.slice(0, 2).forEach(function (u) { items.push({ url: u, quality: 'Auto', src: u, mp4: true }); });
-  return waitWithin(hlsJobs, AYAR.SUNUCU_SURESI).then(function () {
-    var seenS = {}, subs = [];
-    subsAll.forEach(function (s) { if (!seenS[s.url]) { seenS[s.url] = true; subs.push(s); } });
-    var verify = AYAR.ALTYAZI ? subs.map(function (s) {
-      // sayfadan/ana listeden gelenler zaten gerçek; sadece tahmin edilenleri doğrula
-      var guessed = (/\/vtt\/\d+\/\d+\/[a-z0-9]+_[a-z]{2,3}\.vtt/i.test(s.url) || /\/(?:tur|tr)\.vtt$/i.test(s.url)) && found.subs.every(function (f) { return f.url !== s.url; });
-      return guessed ? verifySub(s, ref).catch(function () { return null; }) : Promise.resolve(s);
-    }) : [];
-    return Promise.all(verify).then(function (vs) {
-      var good = vs.filter(Boolean);
-      // Nuvio'da "Bilinmiyor" görünmesin: dili anlaşılamayan altyazı, Türkçe parça yoksa Türkçe sayılır (Dizipal'ın yerleşik altyazısı Türkçe)
-      var hasTur = good.some(function (g) { return g.lang === 'tur'; });
-      good = good.map(function (g) {
-        if (g.lang === 'und' && !hasTur) { hasTur = true; return { url: g.url, lang: 'tur', label: 'Türkçe' }; }
-        if (g.lang === 'und') return { url: g.url, lang: 'und', label: 'Altyazı' };
-        return g;
-      }).sort(function (a, b) { return (a.lang === 'tur' ? 0 : 1) - (b.lang === 'tur' ? 0 : 1); });
-      dbg.push('altyazi sonuc ' + good.map(function (g) { return g.lang + ':' + g.url.slice(-40); }).join(' | '));
-      subNote = '';
-      return Promise.all(good.slice(0, 3).map(function (sb, i) { return checkSub(sb, ref, i === 0); })).then(function (lists) {
-      var fin = [];
-      lists.forEach(function (l) { l.forEach(function (x) { fin.push(x); }); });
-      good = fin;
-      var seen = {};
-      // çalışmayan (liste inmeyen) ve çözünürlüğü bilinmeyen "Auto" akışlar, çalışan akış varken gösterilmez
-      var okItems = items.filter(function (it) { return !it.bad; });
-      if (okItems.length) items = okItems;
-      var resolved = items.filter(function (it) { return it.quality !== 'Auto'; });
-      if (resolved.length) items = resolved;
-      return items.filter(function (it) { if (seen[it.url]) return false; seen[it.url] = true; return true; }).map(function (it) {
-        var parts = ['Dizipal', it.mp4 ? 'MP4' : 'HLS'];
-        if (it.ses) parts.push('Ses ' + it.ses);
-        if (it.seslist) parts.push('Sesler: ' + it.seslist);
-        if (it.native) parts.push('Yerleşik altyazı' + (it.subnames ? ': ' + it.subnames : ''));
-        parts.push(it.quality);
-        if (good.length) parts.push(good.some(function (g) { return g.lang === 'tur'; }) ? 'TR Altyazı' : 'Altyazı');
-        var hd = it.hh ? { 'User-Agent': UA, 'Referer': it.hh, 'Origin': it.hh.replace(/\/$/, '') } : headers;
-        var st = { name: AYAR.EKLENTI_ADI + (AYAR.DEBUG_MODU ? ' [altyazi: ' + (subNote || (good.length ? '?' : 'yok')) + ']' : ''), title: parts.join(' | '), url: it.url, quality: it.quality, headers: hd, provider: PROVIDER_ID };
-        if (it.mp4) st.type = 'mp4';
-        if (good.length) st.subtitles = good.map(function (s, i) { return { url: s.url, lang: s.lang, language: s.lang === 'tur' ? 'Turkish' : s.lang, label: s.label, name: s.label, id: s.lang + (i ? i : ''), kind: 'subtitles', headers: (s.inline || !s.withHeaders) ? undefined : headers }; });
-        return st;
-      });
-      });
-    });
-  });
-}
-
-function getStreamsInner(tmdbId, mediaType, season, episode) {
-  var isTv = mediaType === 'tv';
-  if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
-  season = parseInt(season, 10) || 1; episode = parseInt(episode, 10) || 1;
-  dbg = ['dizipal v1.3.12'];
-  var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv' : 'movie') + '/' + tmdbId + '?api_key=' + TMDB_KEY;
-  return Promise.all([
-    getJson(base + '&language=tr-TR&append_to_response=alternative_titles'),
-    getJson(base + '&language=en-US').catch(function () { return {}; })
-  ]).then(function (both) {
-    var tr = both[0] || {}, en = both[1] || {};
-    var year = parseInt(((isTv ? tr.first_air_date : tr.release_date) || (isTv ? en.first_air_date : en.release_date) || '').slice(0, 4), 10) || 0;
-    var alts = [];
-    try {
-      var at = tr.alternative_titles || {};
-      (at.results || at.titles || []).forEach(function (a) { if (a && a.title && /^(TR|US|GB)$/.test(a.iso_3166_1 || '')) alts.push(a.title); });
-    } catch (e) {}
-    var names = uniq(isTv ? [tr.name, en.name, tr.original_name].concat(alts.slice(0, 4)) : [tr.title, en.title, tr.original_title].concat(alts.slice(0, 4)));
-    if (!names.length) return debugStream('TMDB bilgisi eksik');
-    var kind = isTv ? 'dizi' : 'film';
-    dbg.push((isTv ? 'dizi ' : 'film ') + names[0] + ' ' + year + (isTv ? ' S' + season + 'E' + episode : ''));
-
-    var sinks = [], jobs = [];
-    names.slice(0, AYAR.MAX_SORGU).forEach(function (q) {
-      var sink = []; sinks.push(sink);
-      jobs.push(fetchSite('/arama?q=' + encodeURIComponent(q)).then(function (r) {
-        var items = r.status === 200 ? parseSearch(r.text).filter(function (x) { return x.kind === kind; }) : [];
-        dbg.push('ara "' + q + '" ' + (r.status || r.err) + ' n=' + items.length);
-        sink.push.apply(sink, items);
-      }));
-    });
-    return waitWithin(jobs, AYAR.ARAMA_SURESI).then(function () {
-      var cand = {};
-      sinks.forEach(function (l) { l.forEach(function (it) { if (!cand[it.path]) cand[it.path] = it; }); });
-      names.forEach(function (n) {                                    // adres tahmini
-        var sl = slugify(n);
-        if (sl && !cand['/' + kind + '/' + sl]) cand['/' + kind + '/' + sl] = { path: '/' + kind + '/' + sl, kind: kind, titles: [n], year: 0, guess: true };
-      });
-      var ranked = Object.keys(cand).map(function (p) {
-        var c = cand[p], best = 0;
-        c.titles.forEach(function (t) { names.forEach(function (n) { best = Math.max(best, simScore(t, n)); }); });
-        if (c.guess) best = Math.min(best, 75);
-        if (c.year && year) { var d = Math.abs(c.year - year); best += d === 0 ? 20 : (d === 1 ? 10 : (d > 3 ? -25 : 0)); }
-        return { c: c, score: best };
-      }).filter(function (x) { return x.score >= 50; }).sort(function (a, b) { return b.score - a.score; }).slice(0, AYAR.MAX_ADAY);
-      dbg.push('aday ' + ranked.map(function (x) { return x.c.path + ':' + x.score; }).join(' '));
-      if (!ranked.length) return debugStream('icerik bulunamadi');
-
-      var pages = ranked.map(function () { return null; });
-      var pj = ranked.map(function (x, i) {
-        var path = isTv ? '/bolum/' + x.c.path.replace('/dizi/', '') + '-' + season + '-sezon-' + episode + '-bolum' : x.c.path;
-        return fetchSite(path).then(function (r) {
-          var base = r.base || AYAR.SITELER[0], pageUrl = base + path, html = r.status === 200 ? (r.text || '') : '';
-          dbg.push('sayfa ' + path + ' ' + (r.status || r.err) + ' ' + html.length + 'b');
-          if (!html) return;
-          return getPlayerConfig(html, base, pageUrl, r.cookie || '').then(function (cfg) {
-            var t = cfg ? configTargets(cfg, base) : { embeds: [], direct: null };
-            if (!t.embeds.length && !t.direct) t.embeds = findEmbeds(html);
-            // sayfanın kendisinde de altyazı ara (data-cfg çözümü, gömülü JSON, tracks ...)
-            var pageSubs = (t.subs || []).slice();
-            try {
-              var cfgM = html.match(/data-cfg=["']([^"']+)["']/i);
-              var pt = [html].concat(cfgM ? [decodeHtml(cfgM[1])] : []);
-              pt = pt.concat(deepTexts(pt));
-              pt.forEach(function (tx) { scanText(tx, base).subs.forEach(function (sb) { if (!pageSubs.some(function (q) { return q.url === sb.url; })) pageSubs.push(sb); }); });
-            } catch (e) {}
-            dbg.push('player embed=' + t.embeds.length + (t.direct ? ' direct' : '') + ' sayfaAltyazi=' + pageSubs.length);
-            if (t.embeds.length || t.direct) pages[i] = { url: pageUrl, embeds: t.embeds, direct: t.direct, subs: pageSubs };
-          });
+function findPath(titles, isMovie) {
+    function okType(p) {
+        return isMovie ? p.indexOf('/film/') === 0 : (p.indexOf('/dizi/') === 0 || p.indexOf('/anime/') === 0);
+    }
+    function tryTitle(i) {
+        if (i >= titles.length) return Promise.resolve(null);
+        var q = encodeURIComponent(titles[i]).replace(/\+/g, '%20');
+        return fetchSite('/arama?q=' + q, 1).then(function (site) {
+            if (!site) return tryTitle(i + 1);
+            var cards = parseCards(site.text).filter(function (c) {
+                return okType(c.path);
+            });
+            var nt = titles.map(normTitle);
+            var exact = cards.filter(function (c) {
+                return nt.indexOf(normTitle(c.title)) >= 0;
+            })[0];
+            if (exact) return exact.path;
+            var near = cards.filter(function (c) {
+                var n = normTitle(c.title);
+                return nt.some(function (x) {
+                    return x && (n.indexOf(x) === 0 || x.indexOf(n) === 0);
+                });
+            })[0];
+            if (near) return near.path;
+            return tryTitle(i + 1);
         });
-      });
-      return waitWithin(pj, 10000).then(function () {
-        var pg = null;
-        pages.forEach(function (p) { if (!pg && p) pg = p; });
-        if (!pg) return debugStream('sayfa/player bulunamadi');
-        var results = [];
-        var ej = pg.embeds.slice(0, AYAR.MAX_EMBED).map(function (e, i) {
-          return resolveEmbed(e, pg.url, 0).then(function (found) {
-            if (!found.hls.length && !found.mp4.length) return;
-            found.subs = found.subs.concat(pg.subs || []);          // player ayarı / sayfadan gelen altyazılar
-            return buildStreams(found, pg.url).then(function (st) { results[i] = st; });
-          });
-        });
-        if (pg.direct) pg.direct.subs = (pg.direct.subs || []).concat(pg.subs || []);
-        if (pg.direct) ej.push(buildStreams(pg.direct, pg.url).then(function (st) { results[99] = st; }));
-        return waitWithin(ej, AYAR.SUNUCU_SURESI + 3000).then(function () {
-          var streams = [], seen = {};
-          results.forEach(function (l) { (l || []).forEach(function (s) { if (!seen[s.url]) { seen[s.url] = true; streams.push(s); } }); });
-          if (!streams.length) return debugStream('video linki cikmadi');
-          return AYAR.DEBUG_MODU ? streams.concat(debugStream('akis: ' + streams.length)) : streams;
-        });
-      });
-    });
-  }).catch(function (e) { return debugStream('hata ' + (e && e.message)); });
+    }
+    return tryTitle(0);
 }
 
+// ------------------------------------------------------------------
+// Nuvio giriş noktası
+// ------------------------------------------------------------------
 function getStreams(tmdbId, mediaType, season, episode) {
-  return new Promise(function (resolve) {
-    var done = false;
-    var timer = setTimeout(function () { if (!done) { done = true; resolve(debugStream('zaman asimi ' + AYAR.GENEL_SURE + 'ms')); } }, AYAR.GENEL_SURE);
-    getStreamsInner(tmdbId, mediaType, season, episode).then(function (r) {
-      if (!done) { done = true; clearTimeout(timer); resolve(r); }
-    }, function () { if (!done) { done = true; clearTimeout(timer); resolve([]); } });
-  });
+    var isMovie = mediaType === 'movie';
+    return tmdbTitles(tmdbId, isMovie).then(function (titles) {
+        if (!titles) return [];
+        return findPath(titles, isMovie).then(function (p) {
+            if (!p) {
+                log('içerik bulunamadı', titles);
+                return [];
+            }
+            var path = p;
+            if (!isMovie) {
+                var slug = p.substring(p.lastIndexOf('/') + 1);
+                path = '/bolum/' + slug + '-' + (season || 1) + '-sezon-' + (episode || 1) + '-bolum';
+            }
+            return fetchSite(path, 2).then(function (site) {
+                if (!site) {
+                    log('sayfa alınamadı', path);
+                    return [];
+                }
+                return linksFromPage(site, path);
+            });
+        });
+    }).catch(function (e) {
+        log('hata', e && e.message);
+        return [];
+    });
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { getStreams: getStreams, _t: { inspectHls: inspectHls, buildStreams: buildStreams, guessVtt: guessVtt, xorTexts: xorTexts, xorDecode: xorDecode, resolveEmbed: resolveEmbed, parseSearch: parseSearch, findEmbeds: findEmbeds, unpackAll: unpackAll, scanText: scanText, b64d: b64d } };
-} else {
-  global.getStreams = getStreams;
+    module.exports = { getStreams: getStreams };
+} else if (typeof global !== 'undefined') {
+    global.getStreams = getStreams;
 }
